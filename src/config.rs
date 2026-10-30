@@ -113,7 +113,7 @@ pub enum BackendKind {
     /// Our own index of the transcripts (`crate::index`).
     #[default]
     Native,
-    /// The installed memex binary (kept for comparison).
+    /// Removed (phase 2); still parsed so that an old config gets a clear error.
     Memex,
     Fixture,
 }
@@ -123,12 +123,6 @@ pub enum BackendKind {
 pub struct BackendConfig {
     #[serde(default)]
     pub kind: BackendKind,
-    /// Path to the memex binary; discovered when absent.
-    #[serde(default)]
-    pub memex: Option<String>,
-    /// memex `--root`.
-    #[serde(default)]
-    pub memex_root: Option<String>,
     #[serde(default)]
     pub fixture: Option<PathBuf>,
     #[serde(default)]
@@ -514,9 +508,7 @@ pub fn render_config(machines: &[ImportedMachine], defaults: &[String]) -> Strin
         .join(", ");
     out.push_str(&format!("machines = [{list}]\n"));
     out.push_str("# Per-request deadline for remote machines.\ntimeout = \"5s\"\n\n");
-    out.push_str(
-        "[backend]\n# sessift's own index (~/.sessift/index); \"memex\" uses an installed memex.\nkind = \"native\"\n",
-    );
+    out.push_str("[backend]\n# sessift's own index (~/.sessift/index).\nkind = \"native\"\n");
     for machine in machines {
         out.push_str("\n[[machine]]\n");
         out.push_str(&format!("id = \"{}\"\n", machine.id));
@@ -545,7 +537,7 @@ machines = ["local", "mm"]
 timeout = "3s"
 
 [backend]
-kind = "memex"
+kind = "native"
 
 [[machine]]
 id = "mm"

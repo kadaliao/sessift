@@ -15,25 +15,27 @@ $ sessift search 部署 回滚 -n 3
 
 ## 性能
 
-本机 MacBook + Mac mini（往返约 25ms、带宽 30～500KB/s），每项 10 次取中位数：
+本机 MacBook + Mac mini（往返约 25ms、带宽 30～500KB/s），两台机器都用自研索引，命令行从启动到结束，每项 20 次取中位数（2026-10-31）：
 
 | 场景 | memex 0.31.1 | sessift |
 |---|---|---|
-| 搜索，本机 + 远端 | 2533ms | 154ms |
-| 搜索，只查远端 | 2669ms | 193ms |
-| 50 个会话，本机 + 远端 | 1080ms | 145ms |
-| 搜索，只查本机 | 102ms | 97ms |
+| 搜索，本机 + 远端 | 2171ms | 31ms |
+| 搜索，只查远端 | 2198ms | 39ms |
+| 搜索，只查本机 | 87ms | 22ms |
+| 50 个会话，本机 + 远端 | 624ms | 31ms |
+| 搜索，只查远端，不经 broker | — | 189ms |
 
-用 `scripts/bench.py` 复现。上表是阶段 1 的数据，当时远端后端还是 memex。
+用 `scripts/bench.py` 复现（装了 memex 时同时测它）。
 
-自研索引（本机全量 9.7GB、47 万条记录，命令行从启动到结束，取中位数）：
+自研索引（本机全量 9.7GB、47 万条记录）：
 
 | 场景 | 耗时 |
 |---|---|
-| 搜索（含查询前的增量检查） | 22～25ms（memex 109ms） |
-| 50 个会话 | 22ms |
-| 没有变化时的增量检查 | 19ms |
+| 查询前的增量检查，没有变化 | 约 19ms |
+| 查询前的增量更新，有新记录（正在进行的会话） | 25～35ms |
 | 冷建全量索引 | 12.9 秒，索引 482MB（memex 5GB） |
+
+和 memex 的区别：sessift 也索引 Codex 压缩过的旧会话（`.jsonl.zst`，memex 不读）；原文件已删除的会话不保留；多个搜索词要同时出现在一条记录里（memex 是任一出现）；目前支持 Claude Code、Codex、Pi、OpenCode 四种来源。
 
 ## 安装
 
@@ -144,7 +146,7 @@ machines = ["local", "mm"]   # 不带 -m 时查哪些机器
 timeout = "5s"
 
 [backend]
-kind = "native"              # 自研索引（默认）；"memex" 改用已安装的 memex
+kind = "native"              # 自研索引（默认）
 # refresh_every = "2s"               # 查询前最多多久检查一次新记录；"0" 不自动更新
 # max_concurrency = 4                # 远端同时执行的请求数
 
@@ -172,6 +174,6 @@ scripts/bench.py --sessift target/release/sessift
 
 自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致，覆盖 Claude、Codex、Pi、OpenCode），见 `tests/native.rs` 和 `tests/cli.rs` 的 `native_backend_end_to_end`。
 
-阶段 1 时测试共 81 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、memex 适配器（用假 memex 脚本）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
+测试共 111 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、自研索引（各来源解析、增量更新、段合并）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
 
 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。

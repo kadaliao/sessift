@@ -1,9 +1,8 @@
 //! Query backends. The wire protocol and CLI only see `crate::model` types; a backend turns
-//! requests into results however it likes. Phase 1 ships an adapter over the memex CLI and a
-//! deterministic fixture backend for tests.
+//! requests into results however it likes: our own index (`native`), or a deterministic
+//! fixture backend for tests.
 
 pub mod fixture;
-pub mod memex;
 pub mod native;
 
 use std::path::PathBuf;
@@ -16,7 +15,6 @@ use crate::proto::{CallError, ErrorCode, Op, Reply};
 use crate::text;
 
 pub enum Backend {
-    Memex(memex::MemexBackend),
     Fixture(fixture::FixtureBackend),
     Native(native::NativeBackend),
 }
@@ -31,10 +29,10 @@ impl Backend {
             )?));
         }
         match config.kind {
-            BackendKind::Memex => Ok(Backend::Memex(memex::MemexBackend::new(
-                config.memex.as_deref(),
-                config.memex_root.clone(),
-            ))),
+            BackendKind::Memex => bail!(
+                "the memex backend has been removed; set `kind = \"native\"` under [backend] \
+                 in the config (or delete the line)"
+            ),
             BackendKind::Fixture => {
                 let Some(path) = &config.fixture else {
                     bail!("backend.kind = \"fixture\" needs backend.fixture");
@@ -47,7 +45,6 @@ impl Backend {
 
     pub async fn info(&self) -> BackendInfo {
         match self {
-            Backend::Memex(backend) => backend.info().await,
             Backend::Fixture(backend) => backend.info(),
             Backend::Native(backend) => backend.info().await,
         }
@@ -62,7 +59,6 @@ impl Backend {
             Op::Search(req) => {
                 req.validate().map_err(bad)?;
                 let mut hits = match self {
-                    Backend::Memex(b) => b.search(req).await,
                     Backend::Fixture(b) => b.search(req).await,
                     Backend::Native(b) => b.search(req).await,
                 }
@@ -87,7 +83,6 @@ impl Backend {
             Op::Sessions(req) => {
                 req.validate().map_err(bad)?;
                 let mut sessions = match self {
-                    Backend::Memex(b) => b.sessions(req).await,
                     Backend::Fixture(b) => b.sessions(req).await,
                     Backend::Native(b) => b.sessions(req).await,
                 }
@@ -109,7 +104,6 @@ impl Backend {
             Op::Read(req) => {
                 req.validate().map_err(bad)?;
                 let mut page = match self {
-                    Backend::Memex(b) => b.read(req).await,
                     Backend::Fixture(b) => b.read(req).await,
                     Backend::Native(b) => b.read(req).await,
                 }
@@ -121,7 +115,6 @@ impl Backend {
             Op::Context(req) => {
                 req.validate().map_err(bad)?;
                 let mut page = match self {
-                    Backend::Memex(b) => b.context(req).await,
                     Backend::Fixture(b) => b.context(req).await,
                     Backend::Native(b) => b.context(req).await,
                 }
@@ -146,5 +139,22 @@ impl Backend {
                 format!("{} is not a backend operation", op.name()),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_old_memex_config_says_what_to_change() {
+        let config = BackendConfig {
+            kind: BackendKind::Memex,
+            ..BackendConfig::default()
+        };
+        let Err(err) = Backend::from_config(&config) else {
+            panic!("the memex backend is gone");
+        };
+        assert!(err.to_string().contains("kind = \"native\""), "{err}");
     }
 }

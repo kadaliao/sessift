@@ -33,7 +33,7 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 
 ```json
 {"t":"hello","protocol":1,"version":"0.1.0","host":"mm.local","features":["zstd"],
- "backend":{"kind":"memex","version":"memex 0.31.1"}}
+ "backend":{"kind":"native","version":"0.1.0 1234 sessions"}}
 ```
 
 协议号不一致时服务端回 `fatal`（`code: "protocol_mismatch"`，附带自己的协议号和版本）然后退出。客户端据此提示用户运行 `sessift remote install <machine>`。
@@ -58,7 +58,7 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 失败响应：
 
 ```json
-{"t":"err","id":7,"code":"backend","message":"memex exited with status 2: ..."}
+{"t":"err","id":7,"code":"backend","message":"record 9f3c0a1b2c3d4e5f-1a2b-0 not found"}
 ```
 
 取消：
@@ -102,7 +102,7 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 
 ```json
 {"kind":"info"}  →  {"kind":"info","host":"mm.local","version":"0.1.0","protocol":1,
-                     "backend":{"kind":"memex","version":"memex 0.31.1"},
+                     "backend":{"kind":"native","version":"0.1.0 1234 sessions"},
                      "uptime_ms":12345,"active_requests":0}
 ```
 

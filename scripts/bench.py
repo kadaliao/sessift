@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Compare sessift and memex wall-clock latency on the same queries.
+"""Measure sessift's wall-clock latency, next to memex's when memex is installed.
 
-Usage: scripts/bench.py [--runs N] [--sessift PATH] [--remote ID] [--query Q]
+Usage: scripts/bench.py [--runs N] [--sessift PATH] [--memex PATH] [--remote ID] [--query Q]
 Every command's stdout goes to /dev/null; a non-zero exit is reported as a failure.
 """
 
 import argparse
+import shutil
 import statistics
 import subprocess
 import time
@@ -33,6 +34,7 @@ def main():
     parser.add_argument("--query", default="部署")
     args = parser.parse_args()
 
+    has_memex = shutil.which(args.memex) is not None
     memex = [args.memex, "--no-update-check", "--non-interactive"]
     sessift = [args.sessift]
     r, q = args.remote, args.query
@@ -43,6 +45,8 @@ def main():
         ("50 sessions, local + remote", memex + ["sessions", "--limit", "50"], sessift + ["sessions", "-n", "50"]),
         ("search, remote, no broker", None, sessift + ["--no-broker", "search", q, "-n", "20", "-m", r]),
     ]
+    if not has_memex:
+        cases = [(name, None, cmd) for name, _, cmd in cases]
     # Warm both tools (broker start, index refresh) before measuring.
     for _, a, b in cases:
         for cmd in (a, b):
