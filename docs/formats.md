@@ -78,9 +78,10 @@
 - **记录只取 `response_item` 行**：`event_msg` 是同一内容的重复渲染，全部跳过（解析前按行首字节就能跳过，省掉三分之一的解析量）。
   - `message`，角色是用户：用户消息。注入的上下文按 part 去掉：
     - 有 `content_item_kinds` 而且长度和 part 数一致时，只留 `user.*` 类型的 part。
-    - 没有时按前缀去掉 `<environment_context>`、`# AGENTS.md instructions`、`<turn_aborted>`、`<skill>` 等，完整列表见 `codex.rs`。
+    - 没有时按前缀去掉 `<environment_context>`、`# AGENTS.md instructions`、`<turn_aborted>`、`<skill>`、`<codex_internal_context>`（目标模式每轮自动续上的提示）等，完整列表见 `codex.rs`。
+    - IDE 和桌面版的包装（以 `# Context from my IDE setup:` 或 `# Files mentioned by the user:` 开头，列出打开的文件、附件路径）只留 `## My request for Codex:` 或 `## My request:` 之后的请求。
     - 只含图片包装的 part 也去掉。
-  - `message`，角色是助手：文字 part 用空行连接。`developer`、`system` 角色跳过。
+  - `message`，角色是助手：文字 part 用空行连接，去掉末尾的记忆引用 `<oai-mem-citation>…</oai-mem-citation>`。`developer`、`system` 角色跳过。
   - `function_call`、`custom_tool_call`、`local_shell_call`、`web_search_call`、`tool_search_call`、`image_generation_call`：工具调用。
     - 工具名：如果 `namespace` 以 `mcp__` 开头，工具名是 `namespace__name`。
     - 文字：`exec_command` 取 `cmd`；`shell` 的 `[bash, -lc, X]` 取 `X`；`apply_patch` 取补丁原文；其他取参数 JSON。
@@ -103,7 +104,7 @@
   - `subagent`：文件名里的 id 和头部 id 不同，文件名形如 `<子 agent uuid>-<8>-<8>-<4>`。父会话从 `artifacts/<父 id>/subagent-scripts/*-<子 agent uuid>.sh` 找。
   - `main`：其余情况。
 - **记录**：
-  - `message`，角色是用户：文字块是用户消息。
+  - `message`，角色是用户：文字块是用户消息。调用 skill 时 Pi 把整个 skill 文件包在 `<skill name="X">…</skill>` 里放在前面，记录里换成 `/skill:X` 加用户自己写的部分。
   - `message`，角色是助手：所有文字块合成一条助手记录，每个 `toolCall` 是一条工具调用（参数用 JSON）。
   - `message`，角色是 `toolResult`：工具结果，工具名取 `toolName`，出错时加前缀 `Error: `。
   - `message`，角色是 `bashExecution`：工具结果。

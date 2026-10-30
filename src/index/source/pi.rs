@@ -83,7 +83,7 @@ fn subagent_parent(path: &Path, subagent_id: &str) -> Option<String> {
 
 impl JsonlFormat for Pi {
     const SOURCE: &'static str = "pi";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type State = State;
 
     fn session_id_from_path(&self, path: &Path) -> Option<String> {
@@ -187,6 +187,8 @@ fn message(m: &Value, ts: Option<i64>, state: &State, meta: &mut Meta, out: &mut
             if text.trim().is_empty() {
                 return;
             }
+            // The skill file Pi pastes in is not what the user wrote.
+            let text = skill_call(&text);
             if !state.named && meta.title.is_none() {
                 let title = clean_title(&text);
                 if !title.is_empty() {
@@ -252,19 +254,28 @@ fn render_args(args: &Value) -> String {
     }
 }
 
-/// The title a user message stands for: skill invocations become `/skill:name`, leading
-/// `@file` blocks are dropped (subagent tasks keep the first file's body).
-pub fn clean_title(text: &str) -> String {
-    let mut text = text.trim().to_string();
+/// A skill invocation (`<skill name="x">` + the skill file + `</skill>` + request) as the user
+/// typed it, `/skill:x request`; other text as is.
+fn skill_call(text: &str) -> String {
+    let text = text.trim();
     if let Some(rest) = text.strip_prefix("<skill name=\"")
         && let Some((name, _)) = rest.split_once('"')
         && let Some(end) = text.find("</skill>")
     {
-        text = format!(
+        return format!(
             "/skill:{name} {}",
             &text[end + "</skill>".len()..].trim_start()
-        );
+        )
+        .trim_end()
+        .to_string();
     }
+    text.to_string()
+}
+
+/// The title a user message stands for: skill invocations become `/skill:name`, leading
+/// `@file` blocks are dropped (subagent tasks keep the first file's body).
+pub fn clean_title(text: &str) -> String {
+    let text = skill_call(text);
     let mut rest = text.as_str();
     let mut first_file_body: Option<&str> = None;
     while let Some(after) = rest.trim_start().strip_prefix("<file name=\"") {

@@ -104,7 +104,7 @@ pub fn resume_command(
 
 impl JsonlFormat for Codex {
     const SOURCE: &'static str = "codex";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type State = State;
 
     /// The first UUID in `rollout-<time>-<uuid>[_<generation>].jsonl`.
@@ -273,7 +273,13 @@ fn response_item(p: &Value, state: &mut State) -> Option<Item> {
     let item = match p.get("type").and_then(Value::as_str)? {
         "message" => match p.get("role").and_then(Value::as_str)? {
             "user" => Item::new(Role::User, user_text(p)?),
-            "assistant" => Item::new(Role::Assistant, joined_text(p.get("content"))?),
+            "assistant" => {
+                let text = without_citations(joined_text(p.get("content"))?);
+                if text.is_empty() {
+                    return None;
+                }
+                Item::new(Role::Assistant, text)
+            }
             _ => return None,
         },
         "function_call" => {
@@ -376,8 +382,9 @@ fn joined_text(content: Option<&Value>) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-const INJECTED: [&str; 25] = [
+const INJECTED: [&str; 26] = [
     "<environment_context>",
+    "<codex_internal_context",
     "<user_instructions>",
     "# AGENTS.md instructions",
     "<INSTRUCTIONS>",
@@ -453,11 +460,54 @@ fn user_text(p: &Value) -> Option<String> {
             None => !injected(text),
         };
         if real {
-            keep.push(text);
+            let text = request_part(text);
+            if !text.is_empty() {
+                keep.push(text);
+            }
         }
     }
     let text = keep.join("\n\n").trim().to_string();
     (!text.is_empty()).then_some(text)
+}
+
+/// The request in an IDE or desktop wrapper (`# Context from my IDE setup:`, `# Files
+/// mentioned by the user:` … `## My request for Codex:` request); other text as is.
+fn request_part(text: &str) -> &str {
+    let t = text.trim();
+    if !(t.starts_with("# Context from my IDE setup:")
+        || t.starts_with("# Files mentioned by the user:"))
+    {
+        return t;
+    }
+    for marker in ["## My request for Codex:", "## My request:"] {
+        if let Some(i) = t.rfind(marker) {
+            return t[i + marker.len()..].trim();
+        }
+    }
+    t
+}
+
+/// Assistant text without the memory citations Codex appends.
+fn without_citations(text: String) -> String {
+    const OPEN: &str = "<oai-mem-citation>";
+    const CLOSE: &str = "</oai-mem-citation>";
+    if !text.contains(OPEN) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 /// The title a user message stands for: the request part of IDE/desktop wrappers; heartbeat
@@ -629,6 +679,33 @@ fn search_text(p: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrappers_and_citations_are_dropped() {
+        assert_eq!(
+            request_part(
+                "# Context from my IDE setup:\n\n## Open tabs:\n- a.md\n\n## My request for Codex:\n改一下标题"
+            ),
+            "改一下标题"
+        );
+        assert_eq!(
+            request_part(
+                "# Files mentioned by the user:\n\n## x.png: /tmp/x.png\n\n## My request:\n打几分"
+            ),
+            "打几分"
+        );
+        assert_eq!(
+            request_part("## My request for Codex: 原样"),
+            "## My request for Codex: 原样"
+        );
+        assert_eq!(
+            without_citations("完成了。\n<oai-mem-citation>\n<rollout_ids>\nx\n</rollout_ids>\n</oai-mem-citation>".into()),
+            "完成了。"
+        );
+        assert!(injected(
+            "<codex_internal_context source=\"goal\">\nContinue"
+        ));
+    }
     use crate::index::source::testutil::parse_and_check;
 
     fn home() -> PathBuf {
