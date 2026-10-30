@@ -11,19 +11,19 @@ $ sessift search 部署 回滚 -n 3
        把部署脚本、健康检查和回滚步骤整理成一页手册。
 ```
 
-当前进度：远程查询层、交互界面和自研索引（阶段 2）已完成，默认后端是自研索引，不再需要 memex。路线图见 [docs/plan.md](docs/plan.md)，新会话先读 [CLAUDE.md](CLAUDE.md)。
+当前进度：远程查询层、交互界面、自研索引（阶段 2）和搜索质量（阶段 3，向量检索待定）已完成，默认后端是自研索引，不再需要 memex。路线图见 [docs/plan.md](docs/plan.md)，新会话先读 [CLAUDE.md](CLAUDE.md)。
 
 ## 性能
 
-本机 MacBook + Mac mini（往返约 25ms、带宽 30～500KB/s），两台机器都用自研索引，命令行从启动到结束，每项 20 次取中位数（2026-10-31）：
+本机 MacBook + Mac mini（往返约 25ms、带宽 30～500KB/s），两台机器都用自研索引，命令行从启动到结束，每项 20 次取中位数（sessift 是 2026-10-31 阶段 3 的版本；memex 是卸载前测的）：
 
 | 场景 | memex 0.31.1 | sessift |
 |---|---|---|
-| 搜索，本机 + 远端 | 2171ms | 31ms |
-| 搜索，只查远端 | 2198ms | 39ms |
-| 搜索，只查本机 | 87ms | 22ms |
-| 50 个会话，本机 + 远端 | 624ms | 31ms |
-| 搜索，只查远端，不经 broker | — | 189ms |
+| 搜索，本机 + 远端 | 2171ms | 29ms |
+| 搜索，只查远端 | 2198ms | 45ms |
+| 搜索，只查本机 | 87ms | 21ms |
+| 50 个会话，本机 + 远端 | 624ms | 30ms |
+| 搜索，只查远端，不经 broker | — | 168ms |
 
 用 `scripts/bench.py` 复现（装了 memex 时同时测它）。
 
@@ -33,9 +33,17 @@ $ sessift search 部署 回滚 -n 3
 |---|---|
 | 查询前的增量检查，没有变化 | 约 19ms |
 | 查询前的增量更新，有新记录（正在进行的会话） | 25～35ms |
-| 冷建全量索引 | 12.9 秒，索引 482MB（memex 5GB） |
+| 冷建全量索引 | 8.8 秒，索引 462MB（memex 5GB） |
 
-和 memex 的区别：sessift 也索引 Codex 压缩过的旧会话（`.jsonl.zst`，memex 不读）；原文件已删除的会话不保留；多个搜索词要同时出现在一条记录里（memex 是任一出现）；目前支持 Claude Code、Codex、Pi、OpenCode、Grok 五种来源。
+和 memex 的区别：sessift 也索引 Codex 压缩过的旧会话（`.jsonl.zst`，memex 不读）；原文件已删除的会话不保留；多个搜索词要在同一个会话里都出现（memex 是任一出现）；目前支持 Claude Code、Codex、Pi、OpenCode、Grok 五种来源。
+
+## 搜索和列表
+
+- **按会话排序。** 交互界面每个会话只显示最相关的一条。会话的分数从最好的一条记录出发（用户消息高于助手消息，高于工具调用和输出），命中的记录越多、标题里有搜索词、最近活跃过，分数越高。
+- **多个词**：同一条记录里都出现的排前面；分散在同一会话不同记录里的也能搜到，分数打折。
+- **自动线程排后面**：Codex 的 guardian（自动审批复核）、`codex exec`、`grok -p` 这类脚本跑的会话，以及子 agent，搜索时分数打折；会话列表默认不列它们，只列人对话过的会话（`--kind all` 或界面里按 `a` 显示全部）。
+- **边打字边搜**：交互界面里最后一个英文词没打完也能匹配（`tanti` 找到 `tantivy`）。
+- Codex 分成多个文件的长会话在列表和搜索里是一行，阅读时接起来读。
 
 ## 安装
 
@@ -66,7 +74,7 @@ sessift doctor                             # 检查连接、版本、延迟
 
 | 位置 | 按键 | 作用 |
 |---|---|---|
-| 搜索框 | 输入 | 全文搜索（每个会话只显示最相关的一条）；为空时列出最近会话 |
+| 搜索框 | 输入 | 全文搜索（每个会话只显示最相关的一条，最后一个词按前缀匹配）；为空时列出最近的对话 |
 | 搜索框 | ↓ / Enter | 进入列表 |
 | 搜索框 | Tab | 打开右侧分栏预览并进入列表 |
 | 搜索框 | Esc | 清空搜索；再按一次退出 |
@@ -77,6 +85,7 @@ sessift doctor                             # 检查连接、版本、延迟
 | 列表 | o / → | 全文阅读：j/k 滚动，d/u 半页，g/G 首尾，/ 查找，n/N 跳转，t 展开工具输出 |
 | 列表 | y / Y | 复制会话 ID / 恢复命令 |
 | 列表 | s / t / m | 切换来源 / 时间范围 / 机器筛选 |
+| 列表 | a | 会话列表在"对话"和"全部会话"（含子 agent、guardian、exec）之间切换 |
 | 列表 | / 或直接打字 | 回到搜索框 |
 | 列表 | Ctrl-R | 刷新 |
 | 任意 | 鼠标滚轮、点击 | 滚动、选择；再点一次已选中的会话即恢复 |
@@ -99,8 +108,8 @@ eval "$(sessift shell bash)"                           # bash（只放到命令�
 
 | 命令 | 作用 |
 |---|---|
-| `sessift search <词…>` | 搜索。`-m` 选机器（可重复，`all` 表示全部），`-n` 条数，`--source`、`--project`、`--cwd`、`--role`、`--session`、`--since`、`--until` 过滤 |
-| `sessift sessions` | 按最后活跃时间列会话，`-n`、`--offset` 翻页 |
+| `sessift search <词…>` | 搜索。`-m` 选机器（可重复，`all` 表示全部），`-n` 条数，`--source`、`--project`、`--cwd`、`--role`、`--session`、`--kind`、`--since`、`--until` 过滤；`--per-session` 每个会话一条，`--prefix` 最后一个词按前缀匹配 |
+| `sessift sessions` | 按最后活跃时间列会话，`-n`、`--offset` 翻页。默认只列对话，`--kind`（可重复：`main`、`subagent`、`fork`、`background`、`exec`、`guardian`，或 `conversation`、`all`）改变 |
 | `sessift read <会话 ID>` | 分页读正文。不带 `-m` 时自动在各机器上找这个会话；`--offset`、`-n`、`--max-chars` |
 | `sessift`、`sessift pick` | 交互界面：搜索、预览、阅读、恢复会话 |
 | `sessift shell fish\|zsh\|bash` | 输出快捷键绑定脚本 |
@@ -170,10 +179,13 @@ cargo test                   # 单元测试 + 集成测试（用本地子进程�
 cargo clippy --all-targets
 cargo fmt --check
 scripts/bench.py --sessift target/release/sessift
+scripts/eval.py --sessift target/release/sessift   # 搜索质量评测，见下文
 ```
+
+搜索质量用 `scripts/eval.py` 评测：一组"凭印象找某个会话"的查询（标注了目标会话）和一组主题查询，输出 MRR@10、前 10 命中数、前 10 里自动线程的个数和延迟。查询来自真实会话，放在 `~/.sessift/eval/`，不进仓库；格式见脚本开头。排序参数可以用 `SESSIFT_RANK` 临时覆盖（如 `--env SESSIFT_RANK=cross=0,title=0`），用来在同一份索引上比较。
 
 自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致，覆盖 Claude、Codex、Pi、OpenCode、Grok），见 `tests/native.rs` 和 `tests/cli.rs` 的 `native_backend_end_to_end`。
 
-测试共 120 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、自研索引（各来源解析、增量更新、段合并）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
+测试共 129 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、自研索引（各来源解析、增量更新、段合并）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
 
 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。
