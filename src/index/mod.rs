@@ -3,9 +3,11 @@
 //!
 //! Layout of the index directory (`~/.sessift/index`):
 //! - `meta.sqlite`: files (for incremental parsing), sessions, record locations.
-//! - `tantivy/`: one document per record; the text is indexed, not stored.
+//! - `tantivy/`: one document per record; the text is indexed, and stored zstd-compressed
+//!   for search snippets.
 //! - `write.lock`: held by whichever process is updating the index.
 
+mod directory;
 pub mod fulltext;
 pub mod ingest;
 pub mod project;

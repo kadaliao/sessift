@@ -1100,6 +1100,7 @@ fn index_cmd(paths: &Paths, args: IndexArgs, format: Format) -> Result<i32> {
             wait: true,
             rebuild: args.rebuild,
             budget: None,
+            in_query: false,
             progress: Some(&progress),
         },
     )?

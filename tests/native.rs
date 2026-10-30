@@ -365,3 +365,18 @@ fn opencode_sessions_follow_the_database() {
     assert_eq!(hits[0].source, "opencode");
     assert!(hits[0].snippet.contains("zebrafish"));
 }
+
+#[test]
+fn a_machine_without_transcripts_answers_with_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let index = NativeIndex::new(
+        IndexPaths::new(dir.path().join("index")),
+        Roots::standard(&home),
+        Some(Duration::ZERO),
+    );
+    assert!(search(&index, "回滚").is_empty());
+    let sessions = index.sessions(&SessionsRequest::default()).unwrap();
+    assert!(sessions.is_empty());
+}

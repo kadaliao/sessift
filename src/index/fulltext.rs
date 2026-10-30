@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::Column;
+use tantivy::merge_policy::{LogMergePolicy, MergeCandidate, MergePolicy};
 use tantivy::query::{
     BooleanQuery, ConstScoreQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
     TermSetQuery,
@@ -19,10 +20,11 @@ use tantivy::schema::{
 };
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{
-    DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, SegmentOrdinal, SegmentReader,
-    TantivyDocument, Term,
+    DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, SegmentMeta, SegmentOrdinal,
+    SegmentReader, TantivyDocument, Term,
 };
 
+use super::directory::IndexDirectory;
 use super::tokenizer;
 
 /// Bump when the Tantivy schema or the tokenizer changes; the whole index is rebuilt.
@@ -67,6 +69,41 @@ pub fn schema() -> (Schema, Fields) {
     )
 }
 
+/// Which segment merges a writer runs once it commits. Every commit adds a segment, and
+/// the writer waits for the merges before it is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merges {
+    /// Tantivy's default (`LogMergePolicy`). Keeps the segment count low, but every few
+    /// tens of thousands of new records it rewrites a large part of the index: seconds.
+    All,
+    /// Only segments below `SMALL_SEGMENT_DOCS`, so a query never waits long; the rest is
+    /// left to `Merges::All` in `sessift index`.
+    Small,
+}
+
+/// A segment this small is merged in a query's refresh, as soon as there are
+/// `SMALL_MERGE_COUNT` of them: at most 16k records, a few tens of milliseconds.
+const SMALL_SEGMENT_DOCS: u32 = 2_000;
+const SMALL_MERGE_COUNT: usize = 8;
+
+#[derive(Debug)]
+struct SmallMerges;
+
+impl MergePolicy for SmallMerges {
+    fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+        let small: Vec<_> = segments
+            .iter()
+            .filter(|segment| segment.max_doc() < SMALL_SEGMENT_DOCS)
+            .map(SegmentMeta::id)
+            .collect();
+        if small.len() >= SMALL_MERGE_COUNT {
+            vec![MergeCandidate(small)]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 pub struct FullText {
     pub index: Index,
     pub reader: IndexReader,
@@ -77,8 +114,10 @@ impl FullText {
     pub fn open_or_create(dir: &Path) -> Result<FullText> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let (schema, fields) = schema();
+        let directory = IndexDirectory::open(dir)
+            .with_context(|| format!("open index directory {}", dir.display()))?;
         let index = if dir.join("meta.json").exists() {
-            Index::open_in_dir(dir).with_context(|| format!("open index {}", dir.display()))?
+            Index::open(directory).with_context(|| format!("open index {}", dir.display()))?
         } else {
             let settings = tantivy::IndexSettings {
                 docstore_compression: tantivy::store::Compressor::Zstd(
@@ -86,10 +125,7 @@ impl FullText {
                 ),
                 ..tantivy::IndexSettings::default()
             };
-            Index::builder()
-                .schema(schema)
-                .settings(settings)
-                .create_in_dir(dir)
+            Index::create(directory, schema, settings)
                 .with_context(|| format!("create index {}", dir.display()))?
         };
         Self::from_index(index, fields)
@@ -97,8 +133,10 @@ impl FullText {
 
     pub fn open(dir: &Path) -> Result<FullText> {
         let (_, fields) = schema();
+        let directory = IndexDirectory::open(dir)
+            .with_context(|| format!("open index directory {}", dir.display()))?;
         let index =
-            Index::open_in_dir(dir).with_context(|| format!("open index {}", dir.display()))?;
+            Index::open(directory).with_context(|| format!("open index {}", dir.display()))?;
         Self::from_index(index, fields)
     }
 
@@ -118,13 +156,29 @@ impl FullText {
         })
     }
 
-    pub fn writer(&self, memory_bytes: usize, threads: usize) -> Result<IndexWriter> {
-        let writer = if threads > 0 {
+    pub fn writer(
+        &self,
+        memory_bytes: usize,
+        threads: usize,
+        merges: Merges,
+    ) -> Result<IndexWriter> {
+        let writer: IndexWriter = if threads > 0 {
             self.index.writer_with_num_threads(threads, memory_bytes)?
         } else {
             self.index.writer(memory_bytes)?
         };
+        if merges == Merges::Small {
+            writer.set_merge_policy(Box::new(SmallMerges));
+        }
         Ok(writer)
+    }
+
+    /// Whether Tantivy's default policy has merges waiting, which `Merges::Small` leaves.
+    pub fn merges_due(&self) -> Result<bool> {
+        let segments = self.index.searchable_segment_metas()?;
+        Ok(!LogMergePolicy::default()
+            .compute_merge_candidates(&segments)
+            .is_empty())
     }
 
     pub fn doc(
@@ -477,7 +531,7 @@ mod tests {
     fn index_with(docs: &[(i64, u32, u8, i64, &str)]) -> (tempfile::TempDir, FullText) {
         let dir = tempfile::tempdir().unwrap();
         let ft = FullText::open_or_create(dir.path()).unwrap();
-        let mut writer = ft.writer(15_000_000, 1).unwrap();
+        let mut writer = ft.writer(15_000_000, 1, Merges::All).unwrap();
         for (sess, seq, role, ts, text) in docs {
             writer
                 .add_document(ft.doc(*sess, *seq, *role, *ts, text, None))
@@ -564,13 +618,70 @@ mod tests {
             (1, 2, 0, 3, "alpha"),
             (2, 0, 0, 4, "alpha"),
         ]);
-        let mut writer = ft.writer(15_000_000, 1).unwrap();
+        let mut writer = ft.writer(15_000_000, 1, Merges::All).unwrap();
         ft.delete_from(&writer, 1, 1).unwrap();
         writer.commit().unwrap();
         ft.refresh_reader().unwrap();
         let mut hits = found(&ft, &spec("alpha"));
         hits.sort();
         assert_eq!(hits, vec![(1, 0), (2, 0)]);
+    }
+
+    fn segment_sizes(ft: &FullText) -> Vec<u32> {
+        let mut sizes: Vec<u32> = ft
+            .index
+            .searchable_segment_metas()
+            .unwrap()
+            .iter()
+            .map(SegmentMeta::max_doc)
+            .collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
+    /// One commit (one new segment) per call, the way a query's refresh adds records.
+    fn commit_docs(ft: &FullText, merges: Merges, docs: u64) {
+        let mut writer = ft.writer(15_000_000, 1, merges).unwrap();
+        for seq in 0..docs {
+            writer
+                .add_document(ft.doc(1, seq as u32, 0, 1, "alpha", None))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+    }
+
+    #[test]
+    fn small_merges_leave_big_segments_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ft = FullText::open_or_create(dir.path()).unwrap();
+        // Bigger than SMALL_SEGMENT_DOCS: never merged by a query.
+        for _ in 0..SMALL_MERGE_COUNT {
+            commit_docs(&ft, Merges::Small, SMALL_SEGMENT_DOCS as u64);
+        }
+        assert_eq!(
+            segment_sizes(&ft),
+            vec![SMALL_SEGMENT_DOCS; SMALL_MERGE_COUNT]
+        );
+        assert!(
+            ft.merges_due().unwrap(),
+            "the default policy would merge them"
+        );
+        // Small ones are merged once there are enough of them.
+        for _ in 0..SMALL_MERGE_COUNT - 1 {
+            commit_docs(&ft, Merges::Small, 3);
+        }
+        assert_eq!(segment_sizes(&ft).len(), 2 * SMALL_MERGE_COUNT - 1);
+        commit_docs(&ft, Merges::Small, 3);
+        let sizes = segment_sizes(&ft);
+        assert_eq!(sizes[0], 3 * SMALL_MERGE_COUNT as u32);
+        assert_eq!(sizes.len(), SMALL_MERGE_COUNT + 1);
+        // A commit with nothing new still runs the merges that are due.
+        commit_docs(&ft, Merges::All, 0);
+        assert!(!ft.merges_due().unwrap());
+        assert!(segment_sizes(&ft).len() < SMALL_MERGE_COUNT);
+        let total: u32 = segment_sizes(&ft).iter().sum();
+        assert_eq!(total, (SMALL_SEGMENT_DOCS + 3) * SMALL_MERGE_COUNT as u32);
     }
 
     #[test]

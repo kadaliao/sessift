@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
-use super::fulltext::{FULLTEXT_VERSION, FullText};
+use super::fulltext::{FULLTEXT_VERSION, FullText, Merges};
 use super::project::ProjectNames;
 use super::source::{self, FileParse, FileState, Kind, Roots};
 use super::store::{FileRow, RecordRow, SessionRow, Store};
@@ -43,6 +43,9 @@ pub struct Report {
     pub rebuilt: bool,
     /// More than `Options::budget` was waiting; nothing was parsed.
     pub deferred: bool,
+    /// Left for `sessift index` by a query's refresh: merges bigger than a query should wait
+    /// for (see `Merges`).
+    pub merges_due: bool,
     pub pending_bytes: u64,
     pub took: Duration,
 }
@@ -69,6 +72,9 @@ pub struct Options<'a> {
     pub rebuild: bool,
     /// Parse at most this many bytes; with more waiting, return `deferred` instead.
     pub budget: Option<u64>,
+    /// Refreshing for a query: run only small merges and report bigger ones as
+    /// `merges_due`. Otherwise, run every merge that is due, even with nothing new to parse.
+    pub in_query: bool,
     pub progress: Option<&'a (dyn Fn(Progress) + Sync)>,
 }
 
@@ -159,7 +165,13 @@ pub fn refresh(paths: &IndexPaths, roots: &Roots, opts: &Options) -> Result<Opti
         true
     });
 
-    if jobs.is_empty() && removed.is_empty() && moves.is_empty() {
+    // Nothing to parse; still go on for the first build (even an empty one: queries need
+    // `refreshed_ms`) and, outside a query, for merges left by queries.
+    let nothing_new = jobs.is_empty()
+        && removed.is_empty()
+        && moves.is_empty()
+        && store.meta("refreshed_ms")?.is_some();
+    if nothing_new && opts.in_query {
         report.took = started.elapsed();
         return Ok(Some(report));
     }
@@ -172,14 +184,23 @@ pub fn refresh(paths: &IndexPaths, roots: &Roots, opts: &Options) -> Result<Opti
         return Ok(Some(report));
     }
     let ft = FullText::open_or_create(&paths.fulltext())?;
+    if nothing_new && !ft.merges_due()? {
+        report.took = started.elapsed();
+        return Ok(Some(report));
+    }
+    let merges = if opts.in_query {
+        Merges::Small
+    } else {
+        Merges::All
+    };
     let big = bytes_total > 256 << 20;
     let mut writer = if big {
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get())
             .clamp(1, 6);
-        ft.writer(threads * 200_000_000, threads)?
+        ft.writer(threads * 200_000_000, threads, merges)?
     } else {
-        ft.writer(64_000_000, 1)?
+        ft.writer(64_000_000, 1, merges)?
     };
     store.begin()?;
     let result = (|| -> Result<()> {
@@ -284,6 +305,9 @@ pub fn refresh(paths: &IndexPaths, roots: &Roots, opts: &Options) -> Result<Opti
     }
     writer.wait_merging_threads()?;
     ft.refresh_reader()?;
+    if opts.in_query {
+        report.merges_due = ft.merges_due()?;
+    }
     report.took = started.elapsed();
     Ok(Some(report))
 }

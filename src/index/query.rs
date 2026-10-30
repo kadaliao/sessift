@@ -89,12 +89,13 @@ impl NativeIndex {
         }
         let opts = ingest::Options {
             budget: self.background.as_ref().map(|b| b.budget),
+            in_query: true,
             ..ingest::Options::default()
         };
         let result = ingest::refresh(&self.paths, &self.roots, &opts);
         *last = Some(Instant::now());
         match result {
-            Ok(Some(report)) if report.deferred => {
+            Ok(Some(report)) if report.deferred || report.merges_due => {
                 if let Some(background) = &self.background
                     && let Err(err) = ingest::spawn_indexer(&background.paths)
                 {
