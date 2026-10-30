@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
@@ -59,6 +61,8 @@ pub enum Command {
     /// Inspect or stop the background broker
     #[command(subcommand)]
     Broker(BrokerCmd),
+    /// Build or update this machine's index of session transcripts
+    Index(IndexArgs),
     /// Browse and search sessions interactively; Enter resumes one
     Pick(PickArgs),
     /// Print the key binding that opens `sessift pick` (fish, zsh or bash)
@@ -230,6 +234,24 @@ pub enum BrokerCmd {
 }
 
 #[derive(Args, Debug)]
+pub struct IndexArgs {
+    #[command(subcommand)]
+    pub cmd: Option<IndexCmd>,
+    /// Throw the index away and build it again
+    #[arg(long)]
+    pub rebuild: bool,
+    /// No progress output
+    #[arg(long, short)]
+    pub quiet: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IndexCmd {
+    /// Show what the index holds and what is waiting to be indexed
+    Stats,
+}
+
+#[derive(Args, Debug)]
 pub struct ServeArgs {
     /// Speak the protocol on stdin/stdout
     #[arg(long)]
@@ -270,6 +292,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Broker(cmd) => broker_cmd(&paths, cmd, Format::resolve(cli.format)).await,
+        Command::Index(args) => {
+            let paths = paths.clone();
+            let format = Format::resolve(cli.format);
+            tokio::task::spawn_blocking(move || index_cmd(&paths, args, format))
+                .await
+                .context("index task")?
+        }
         command => {
             let config = Config::load(&paths)?;
             let format = Format::resolve(cli.format);
@@ -289,7 +318,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
                     remote_install(&ctx, &machines, force).await
                 }
                 Command::Pick(args) => pick_cmd(&ctx, args).await,
-                Command::Serve(_) | Command::Init(_) | Command::Broker(_) | Command::Shell(_) => {
+                Command::Serve(_)
+                | Command::Init(_)
+                | Command::Broker(_)
+                | Command::Shell(_)
+                | Command::Index(_) => {
                     unreachable!()
                 }
             }
@@ -980,4 +1013,150 @@ async fn broker_cmd(paths: &Paths, cmd: BrokerCmd, format: Format) -> Result<i32
             Ok(0)
         }
     }
+}
+
+fn index_cmd(paths: &Paths, args: IndexArgs, format: Format) -> Result<i32> {
+    use crate::index::IndexPaths;
+    use crate::index::ingest::{self, Progress};
+    use crate::index::source::Roots;
+    use crate::index::store::Store;
+
+    let index = IndexPaths::new(paths.index_dir());
+    let roots = Roots::from_env();
+    if let Some(IndexCmd::Stats) = args.cmd {
+        let (pending_files, pending_bytes) = ingest::pending(&index, &roots)?;
+        let store = Store::open_readonly(&index.db()).ok();
+        let counts = match &store {
+            Some(store) => store.counts_by_source()?,
+            None => Vec::new(),
+        };
+        let refreshed = store
+            .as_ref()
+            .and_then(|s| s.meta("refreshed_ms").ok().flatten())
+            .and_then(|v| v.parse::<i64>().ok());
+        let size = dir_size(&index.dir);
+        if format != Format::Text {
+            let sources: Vec<_> = counts
+                .iter()
+                .map(|(source, sessions, records)| {
+                    json!({"source": source, "sessions": sessions, "records": records})
+                })
+                .collect();
+            emit(&format!(
+                "{}\n",
+                json!({
+                    "dir": index.dir,
+                    "bytes": size,
+                    "refreshed_ms": refreshed,
+                    "sources": sources,
+                    "pending_files": pending_files,
+                    "pending_bytes": pending_bytes,
+                })
+            ));
+            return Ok(0);
+        }
+        let style = Style::stdout();
+        println!("{} {}", style.bold("index"), index.dir.display());
+        if store.is_none() {
+            println!("  not built yet: run `sessift index`");
+        }
+        for (source, sessions, records) in &counts {
+            println!("  {source:<9} {sessions:>6} sessions {records:>9} records");
+        }
+        println!("  size {}", human_bytes(size));
+        if let Some(ms) = refreshed {
+            println!("  updated {}", crate::timefmt::local_second(ms));
+        }
+        if pending_files > 0 {
+            println!(
+                "  {} files ({}) changed since; the next query or `sessift index` picks them up",
+                pending_files,
+                human_bytes(pending_bytes)
+            );
+        }
+        return Ok(0);
+    }
+
+    let show = !args.quiet && std::io::stderr().is_terminal();
+    let last = std::sync::Mutex::new(Instant::now());
+    let progress = |p: Progress| {
+        let mut last = last.lock().unwrap();
+        if !show || (last.elapsed() < Duration::from_millis(200) && p.files_done < p.files_total) {
+            return;
+        }
+        *last = Instant::now();
+        eprint!(
+            "\r\x1b[2Kindexing {}/{} files · {} / {}",
+            p.files_done,
+            p.files_total,
+            human_bytes(p.bytes_done),
+            human_bytes(p.bytes_total)
+        );
+    };
+    let report = ingest::refresh(
+        &index,
+        &roots,
+        &ingest::Options {
+            wait: true,
+            rebuild: args.rebuild,
+            budget: None,
+            progress: Some(&progress),
+        },
+    )?
+    .expect("waits for the writer lock");
+    if show {
+        eprint!("\r\x1b[2K");
+    }
+    for (path, err) in &report.failures {
+        eprintln!("{} {path}: {err}", Style::stderr().yellow("skipped"));
+    }
+    if format != Format::Text {
+        emit(&format!(
+            "{}\n",
+            json!({
+                "files_seen": report.files_seen,
+                "files_parsed": report.files_parsed,
+                "files_removed": report.files_removed,
+                "files_moved": report.files_moved,
+                "bytes_parsed": report.bytes_parsed,
+                "records_added": report.records_added,
+                "bad_lines": report.bad_lines,
+                "rebuilt": report.rebuilt,
+                "took_ms": report.took.as_millis() as u64,
+            })
+        ));
+    } else if !args.quiet {
+        if report.changed() {
+            println!(
+                "{} files parsed ({}), {} records added, {} removed, {} moved in {}",
+                report.files_parsed,
+                human_bytes(report.bytes_parsed),
+                report.records_added,
+                report.files_removed,
+                report.files_moved,
+                human_duration(report.took)
+            );
+        } else {
+            println!(
+                "up to date ({} files checked in {})",
+                report.files_seen,
+                human_duration(report.took)
+            );
+        }
+    }
+    Ok(if report.failures.is_empty() { 0 } else { 1 })
+}
+
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
 }

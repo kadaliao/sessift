@@ -11,7 +11,7 @@ $ sessift search 部署 回滚 -n 3
        把部署脚本、健康检查和回滚步骤整理成一页手册。
 ```
 
-当前进度：远程查询层和交互界面已完成；每台机器上的查询后端暂时调用已安装的 memex，下一步是自研索引。路线图见 [docs/plan.md](docs/plan.md)，新会话先读 [CLAUDE.md](CLAUDE.md)。
+当前进度：远程查询层、交互界面和自研索引（阶段 2）已完成，默认后端是自研索引，不再需要 memex。路线图见 [docs/plan.md](docs/plan.md)，新会话先读 [CLAUDE.md](CLAUDE.md)。
 
 ## 性能
 
@@ -24,7 +24,16 @@ $ sessift search 部署 回滚 -n 3
 | 50 个会话，本机 + 远端 | 1080ms | 145ms |
 | 搜索，只查本机 | 102ms | 97ms |
 
-用 `scripts/bench.py` 复现。
+用 `scripts/bench.py` 复现。上表是阶段 1 的数据，当时远端后端还是 memex。
+
+自研索引（本机全量 9.7GB、47 万条记录，命令行从启动到结束，取中位数）：
+
+| 场景 | 耗时 |
+|---|---|
+| 搜索（含查询前的增量检查） | 22～25ms（memex 109ms） |
+| 50 个会话 | 22ms |
+| 没有变化时的增量检查 | 19ms |
+| 冷建全量索引 | 12.9 秒，索引 482MB（memex 5GB） |
 
 ## 安装
 
@@ -36,7 +45,7 @@ sessift remote install mm                  # 把同一个二进制装到远端 ~
 sessift doctor                             # 检查连接、版本、延迟
 ```
 
-远端机器需要能用 `ssh <别名>` 免密登录，并且装好 memex、建好索引（过渡期后端）。
+远端机器需要能用 `ssh <别名>` 免密登录。每台机器第一次被查询时会在后台建索引（几秒到十几秒），之后查询前自动增量更新；也可以手动 `sessift index`。
 `remote install` 要求两边是同一平台（如都是 Darwin arm64）；远端已是同一份二进制时跳过上传。
 
 ## 交互界面（Alt-M，或直接运行 `sessift`）
@@ -97,6 +106,7 @@ eval "$(sessift shell bash)"                           # bash（只放到命令�
 | `sessift doctor` | 逐项诊断：后端、全新 SSH 握手耗时、往返延迟、样例查询耗时和传输量、broker 状态 |
 | `sessift remote install <机器…>` | 安装或更新远端二进制 |
 | `sessift broker status` / `stop` | 查看或停止后台 broker |
+| `sessift index` | 建立或增量更新本机索引；`--rebuild` 重建，`index stats` 看各来源会话数、索引大小和待处理文件 |
 
 时间参数支持 `7d`、`12h`、`2026-10-01`、`2026-10-01 09:30`、RFC 3339 和 Unix 时间戳。
 
@@ -134,8 +144,8 @@ machines = ["local", "mm"]   # 不带 -m 时查哪些机器
 timeout = "5s"
 
 [backend]
-kind = "memex"               # 过渡期后端
-# memex = "/opt/homebrew/bin/memex"   # 默认自动查找
+kind = "native"              # 自研索引（默认）；"memex" 改用已安装的 memex
+# refresh_every = "2s"               # 查询前最多多久检查一次新记录；"0" 不自动更新
 # max_concurrency = 4                # 远端同时执行的请求数
 
 [broker]
@@ -160,6 +170,8 @@ cargo fmt --check
 scripts/bench.py --sessift target/release/sessift
 ```
 
-测试共 81 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、memex 适配器（用假 memex 脚本）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
+自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致，覆盖 Claude、Codex、Pi、OpenCode），见 `tests/native.rs` 和 `tests/cli.rs` 的 `native_backend_end_to_end`。
+
+阶段 1 时测试共 81 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、memex 适配器（用假 memex 脚本）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
 
 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。

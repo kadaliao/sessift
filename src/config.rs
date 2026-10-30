@@ -55,6 +55,9 @@ impl Paths {
     pub fn broker_log(&self) -> PathBuf {
         self.log_dir().join("broker.log")
     }
+    pub fn index_dir(&self) -> PathBuf {
+        self.home.join("index")
+    }
 
     /// Whether the broker socket path fits the platform limit.
     pub fn broker_socket_usable(&self) -> bool {
@@ -107,7 +110,10 @@ pub struct Defaults {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    /// Our own index of the transcripts (`crate::index`).
     #[default]
+    Native,
+    /// The installed memex binary (kept for comparison).
     Memex,
     Fixture,
 }
@@ -127,6 +133,9 @@ pub struct BackendConfig {
     pub fixture: Option<PathBuf>,
     #[serde(default)]
     pub max_concurrency: Option<usize>,
+    /// Native backend: how stale the index may get before a query updates it ("0" never).
+    #[serde(default, deserialize_with = "de_opt_duration")]
+    pub refresh_every: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -505,7 +514,9 @@ pub fn render_config(machines: &[ImportedMachine], defaults: &[String]) -> Strin
         .join(", ");
     out.push_str(&format!("machines = [{list}]\n"));
     out.push_str("# Per-request deadline for remote machines.\ntimeout = \"5s\"\n\n");
-    out.push_str("[backend]\n# Interim backend: the installed memex binary.\nkind = \"memex\"\n");
+    out.push_str(
+        "[backend]\n# sessift's own index (~/.sessift/index); \"memex\" uses an installed memex.\nkind = \"native\"\n",
+    );
     for machine in machines {
         out.push_str("\n[[machine]]\n");
         out.push_str(&format!("id = \"{}\"\n", machine.id));

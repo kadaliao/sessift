@@ -696,3 +696,136 @@ fn shell_snippets_are_valid_syntax() {
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("bind ctrl-o sessift-widget"));
 }
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// A home directory with the synthetic transcripts of every source, and a sessift home
+/// configured for the native backend.
+fn native_machine(root: &Path, name: &str) -> (String, String) {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let home = root.join(format!("{name}-home"));
+    copy_tree(&fixtures.join("home"), &home);
+    let opencode = home.join(".local/share/opencode");
+    std::fs::create_dir_all(&opencode).unwrap();
+    let conn = rusqlite::Connection::open(opencode.join("opencode.db")).unwrap();
+    for file in ["schema.sql", "insert.sql"] {
+        let sql = std::fs::read_to_string(fixtures.join("opencode").join(file)).unwrap();
+        conn.execute_batch(&sql).unwrap();
+    }
+    let sessift_home = root.join(format!("{name}-sessift"));
+    std::fs::create_dir_all(&sessift_home).unwrap();
+    (
+        home.to_string_lossy().into_owned(),
+        sessift_home.to_string_lossy().into_owned(),
+    )
+}
+
+#[test]
+fn native_backend_end_to_end() {
+    let root = tempfile::Builder::new().prefix("sft").tempdir().unwrap();
+    let (home, sessift_home) = native_machine(root.path(), "local");
+    let (far_home, far_sessift) = native_machine(root.path(), "far");
+    let native = "[backend]\nkind = \"native\"\n";
+    std::fs::write(Path::new(&far_sessift).join("config.toml"), native).unwrap();
+    let far_argv = [
+        "env".to_string(),
+        format!("HOME={far_home}"),
+        format!("SESSIFT_HOME={far_sessift}"),
+        bin().to_string(),
+        "serve".into(),
+        "--stdio".into(),
+    ]
+    .map(q)
+    .join(", ");
+    std::fs::write(
+        Path::new(&sessift_home).join("config.toml"),
+        format!(
+            "[defaults]\nmachines = [\"local\", \"far\"]\ntimeout = \"10s\"\n\n{native}\n[[machine]]\nid = \"far\"\ncommand = [{far_argv}]\n"
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> Value {
+        let out = Command::new(bin())
+            .args(args)
+            .args(["--format", "json", "--no-broker"])
+            .env("HOME", &home)
+            .env("SESSIFT_HOME", &sessift_home)
+            .env_remove("SESSIFT_FIXTURE")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // The first query builds each machine's index (small enough to do inline).
+    let found = run(&["search", "回滚", "-n", "50"]);
+    let mut seen: Vec<String> = found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["snippet"].as_str().unwrap().contains("回滚还来得及"))
+        .map(|r| {
+            format!(
+                "{}:{}",
+                r["machine"].as_str().unwrap(),
+                r["source"].as_str().unwrap()
+            )
+        })
+        .collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen,
+        [
+            "far:claude",
+            "far:codex",
+            "far:opencode",
+            "far:pi",
+            "local:claude",
+            "local:codex",
+            "local:opencode",
+            "local:pi"
+        ]
+    );
+
+    let sessions = run(&["sessions", "-n", "100"]);
+    let rows = sessions["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 2 * 13, "13 sessions per machine");
+    let codex = rows
+        .iter()
+        .find(|r| r["machine"] == "far" && r["source"] == "codex" && r["kind"] == "main")
+        .unwrap();
+
+    let page = run(&[
+        "read",
+        codex["session_id"].as_str().unwrap(),
+        "-m",
+        "far",
+        "-n",
+        "3",
+    ]);
+    assert_eq!(page["machine"], "far");
+    assert_eq!(page["records"].as_array().unwrap().len(), 3);
+    assert!(page["total"].as_u64().unwrap() > 3);
+
+    let stats = run(&["index", "stats"]);
+    assert_eq!(stats["pending_files"], 0);
+    let sources: Vec<&str> = stats["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, ["claude", "codex", "opencode", "pi"]);
+}

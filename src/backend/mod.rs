@@ -4,6 +4,7 @@
 
 pub mod fixture;
 pub mod memex;
+pub mod native;
 
 use std::path::PathBuf;
 
@@ -17,6 +18,7 @@ use crate::text;
 pub enum Backend {
     Memex(memex::MemexBackend),
     Fixture(fixture::FixtureBackend),
+    Native(native::NativeBackend),
 }
 
 impl Backend {
@@ -39,6 +41,7 @@ impl Backend {
                 };
                 Ok(Backend::Fixture(fixture::FixtureBackend::load(path)?))
             }
+            BackendKind::Native => Ok(Backend::Native(native::NativeBackend::from_config(config)?)),
         }
     }
 
@@ -46,6 +49,7 @@ impl Backend {
         match self {
             Backend::Memex(backend) => backend.info().await,
             Backend::Fixture(backend) => backend.info(),
+            Backend::Native(backend) => backend.info().await,
         }
     }
 
@@ -60,6 +64,7 @@ impl Backend {
                 let mut hits = match self {
                     Backend::Memex(b) => b.search(req).await,
                     Backend::Fixture(b) => b.search(req).await,
+                    Backend::Native(b) => b.search(req).await,
                 }
                 .map_err(failed)?;
                 if req.unique_sessions {
@@ -84,6 +89,7 @@ impl Backend {
                 let mut sessions = match self {
                     Backend::Memex(b) => b.sessions(req).await,
                     Backend::Fixture(b) => b.sessions(req).await,
+                    Backend::Native(b) => b.sessions(req).await,
                 }
                 .map_err(failed)?;
                 sessions.truncate(req.limit as usize);
@@ -105,6 +111,7 @@ impl Backend {
                 let mut page = match self {
                     Backend::Memex(b) => b.read(req).await,
                     Backend::Fixture(b) => b.read(req).await,
+                    Backend::Native(b) => b.read(req).await,
                 }
                 .map_err(failed)?;
                 page.records.truncate(req.limit as usize);
@@ -116,6 +123,7 @@ impl Backend {
                 let mut page = match self {
                     Backend::Memex(b) => b.context(req).await,
                     Backend::Fixture(b) => b.context(req).await,
+                    Backend::Native(b) => b.context(req).await,
                 }
                 .map_err(failed)?;
                 let side = (req.before + req.after + 1) as usize;

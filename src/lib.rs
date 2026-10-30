@@ -9,6 +9,7 @@ pub mod client;
 pub mod codec;
 pub mod config;
 pub mod fanout;
+pub mod index;
 pub mod install;
 pub mod model;
 pub mod output;

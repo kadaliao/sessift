@@ -1,0 +1,3 @@
+#!/bin/bash
+# Subagent launch script for check-links
+cd '/Users/alice/work/blog' && PI_SUBAGENT_NAME='check-links' PI_SUBAGENT_ID='5f3c2d1e-6a7b-4c8d-9e0f-1a2b3c4d5e6f' PI_SUBAGENT_SESSION='/Users/alice/.pi/agent/sessions/--Users-alice-work-blog--/2026-03-01T09-05-00-000Z_5f3c2d1e-6a7b-4c8d-9e0f-1a2b3c4d5e6f-1a2b3c4d-5e6f7a8b-9c0d.jsonl' pi --session '/Users/alice/.pi/agent/sessions/--Users-alice-work-blog--/2026-03-01T09-05-00-000Z_5f3c2d1e-6a7b-4c8d-9e0f-1a2b3c4d5e6f-1a2b3c4d-5e6f7a8b-9c0d.jsonl' '@/Users/alice/.pi/agent/sessions/--Users-alice-work-blog--/artifacts/0190f3a2-1c00-7000-8000-00000000a001/context/check-links-2026-03-01T09-05-00.md'; echo '__SUBAGENT_DONE_'$?'__'

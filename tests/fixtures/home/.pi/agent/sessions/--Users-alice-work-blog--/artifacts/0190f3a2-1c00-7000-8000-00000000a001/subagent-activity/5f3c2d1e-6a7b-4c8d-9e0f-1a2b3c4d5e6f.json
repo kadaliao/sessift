@@ -1,0 +1,1 @@
+{"version": 1, "runningChildId": "5f3c2d1e-6a7b-4c8d-9e0f-1a2b3c4d5e6f", "createdAt": 1772355900000, "updatedAt": 1772355960000, "sequence": 7, "latestEvent": "agent_end", "phase": "done", "agentActive": false, "turnActive": false, "providerActive": false, "toolActive": false, "turnIndex": 2}
