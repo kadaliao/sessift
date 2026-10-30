@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::fulltext::{FullText, SearchSpec};
+use super::fulltext::{FullText, Hit, SearchSpec, query_terms};
 use super::ingest::{self, INDEX_MESSAGE_BYTES, Report};
+use super::rank::{self, Rank};
 use super::source::{self, Kind, Role, Roots};
 use super::store::{RecordRow, SessionRow, Store};
 use super::{IndexPaths, tokenizer};
@@ -174,17 +175,29 @@ impl NativeIndex {
                 None => return Ok(Vec::new()),
             },
         };
+        let rank = Rank::current();
         let sessions = open.store.session_ids(&req.filters)?;
-        let hits = open.ft.search(&SearchSpec {
+        let weights: HashMap<i64, f32> = open
+            .store
+            .sessions_of_kinds(&["guardian", "exec", "subagent"])?
+            .into_iter()
+            .map(|(id, kind)| (id, rank.kind_weight(Some(&kind))))
+            .collect();
+        let spec = SearchSpec {
             query: &req.query,
             sessions: sessions.as_deref(),
             role,
             since_ms: req.filters.since_ms,
             until_ms: req.filters.until_ms,
+            limit: req.limit as usize,
+            weights: Some(Arc::new(weights)),
+        };
+        let hits = if req.unique_sessions {
             // A session split over several files may come back once per file.
-            limit: req.limit as usize + if req.unique_sessions { SPLIT_SLACK } else { 0 },
-            unique_sessions: req.unique_sessions,
-        })?;
+            rank_sessions(open, &spec, rank, req.limit as usize + SPLIT_SLACK)?
+        } else {
+            open.ft.search(&spec)?
+        };
         let stored = open.ft.stored_texts(&hits);
         let mut sessions: HashMap<i64, Option<SessionRow>> = HashMap::new();
         let mut found = Vec::with_capacity(hits.len());
@@ -346,6 +359,75 @@ impl NativeIndex {
             records,
         })
     }
+}
+
+/// The best `limit` sessions for a search, each as its best record. A session matches when
+/// one record holds every term or, scored lower, when the terms are spread over its records.
+fn rank_sessions(open: &Open, spec: &SearchSpec, rank: &Rank, limit: usize) -> Result<Vec<Hit>> {
+    let terms: Vec<String> = query_terms(spec.query)
+        .into_iter()
+        .filter(|t| !tokenizer::tokens(t).is_empty())
+        .collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Session -> (record to show, score before title and recency).
+    let mut found: HashMap<i64, (Hit, f32)> = open
+        .ft
+        .session_matches(spec, &terms)?
+        .into_iter()
+        .map(|(sess, m)| (sess, (m.best, rank.base(m.best.score, m.records))))
+        .collect();
+    if terms.len() > 1 && rank.cross > 0.0 {
+        let per_term = terms
+            .iter()
+            .map(|t| open.ft.session_matches(spec, std::slice::from_ref(t)))
+            .collect::<Result<Vec<_>>>()?;
+        let (first, rest) = per_term.split_first().expect("two or more terms");
+        'session: for (sess, m) in first {
+            if found.contains_key(sess) {
+                continue;
+            }
+            let (mut sum, mut best, mut records) = (m.best.score, m.best, m.records);
+            for other in rest {
+                let Some(o) = other.get(sess) else {
+                    continue 'session;
+                };
+                sum += o.best.score;
+                if o.best.score > best.score {
+                    best = o.best;
+                }
+                records = records.min(o.records);
+            }
+            found.insert(*sess, (best, rank.base(rank.cross * sum, records)));
+        }
+    }
+    let mut ranked: Vec<(Hit, f32)> = found.into_values().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.0.ts.cmp(&a.0.ts)));
+    // Title and recency only reorder the front of the list.
+    ranked.truncate((limit * 4).max(100));
+    let ids: Vec<i64> = ranked.iter().map(|(hit, _)| hit.sess).collect();
+    let info = open.store.titles_and_times(&ids)?;
+    let now = crate::timefmt::now_ms();
+    let mut hits: Vec<Hit> = ranked
+        .into_iter()
+        .map(|(mut hit, base)| {
+            let (share, last) = match info.get(&hit.sess) {
+                Some((title, last)) => (
+                    title
+                        .as_deref()
+                        .map_or(0.0, |t| rank::title_share(&terms, t)),
+                    *last,
+                ),
+                None => (0.0, hit.ts),
+            };
+            hit.score = rank.adjust(base, share, now - last);
+            hit
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| b.ts.cmp(&a.ts)));
+    hits.truncate(limit);
+    Ok(hits)
 }
 
 /// Record views for a page, each text cut to at most `max_chars` (the page budget is applied

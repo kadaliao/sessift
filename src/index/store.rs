@@ -386,6 +386,40 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Sessions of the given kinds, with their kind.
+    pub fn sessions_of_kinds(&self, kinds: &[&str]) -> Result<Vec<(i64, String)>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT id, kind FROM sessions WHERE kind IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(kinds), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Title and last activity of each of these sessions.
+    pub fn titles_and_times(&self, ids: &[i64]) -> Result<HashMap<i64, (Option<String>, i64)>> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id, title, last_ms FROM sessions WHERE id IN ({marks})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+                Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+            })?;
+            for row in rows {
+                let (id, value) = row?;
+                out.insert(id, value);
+            }
+        }
+        Ok(out)
+    }
+
     /// Ids of the sessions a search may return, or `None` when no session-level filter is set.
     pub fn session_ids(&self, filters: &Filters) -> Result<Option<Vec<i64>>> {
         let (clause, args) = session_where(filters, false, "all");

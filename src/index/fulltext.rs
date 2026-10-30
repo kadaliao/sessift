@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tantivy::collector::{Collector, SegmentCollector};
@@ -243,16 +244,37 @@ impl FullText {
         Ok(())
     }
 
+    /// Best records matching every term of the query.
     pub fn search(&self, spec: &SearchSpec) -> Result<Vec<Hit>> {
-        let Some(query) = self.build_query(spec)? else {
+        let terms = query_terms(spec.query);
+        let Some(query) = self.build_query(spec, &terms)? else {
             return Ok(Vec::new());
         };
         let searcher = self.reader.searcher();
         let collector = TopHits {
             limit: spec.limit,
-            unique: spec.unique_sessions,
+            weights: spec.weights.clone(),
         };
         Ok(searcher.search(&query, &collector)?)
+    }
+
+    /// For every session with a record matching all of `terms`: its best record and how many
+    /// records match.
+    pub fn session_matches(
+        &self,
+        spec: &SearchSpec,
+        terms: &[String],
+    ) -> Result<HashMap<i64, SessionMatch>> {
+        let Some(query) = self.build_query(spec, terms)? else {
+            return Ok(HashMap::new());
+        };
+        let searcher = self.reader.searcher();
+        Ok(searcher.search(
+            &query,
+            &SessionCollector {
+                weights: spec.weights.clone(),
+            },
+        )?)
     }
 
     /// Stored texts of hits, in order.
@@ -269,11 +291,11 @@ impl FullText {
             .collect()
     }
 
-    fn build_query(&self, spec: &SearchSpec) -> Result<Option<Box<dyn Query>>> {
+    fn build_query(&self, spec: &SearchSpec, terms: &[String]) -> Result<Option<Box<dyn Query>>> {
         let f = &self.fields;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for term in query_terms(spec.query) {
-            let tokens = tokenizer::tokens(&term);
+        for term in terms {
+            let tokens = tokenizer::tokens(term);
             let query: Box<dyn Query> = match tokens.as_slice() {
                 [] => continue,
                 [one] if tokenizer::is_single_cjk(one) => {
@@ -355,7 +377,15 @@ pub struct SearchSpec<'a> {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
     pub limit: usize,
-    pub unique_sessions: bool,
+    /// Score multipliers of sessions (by kind); sessions not in the map count 1.
+    pub weights: Option<Arc<HashMap<i64, f32>>>,
+}
+
+/// A session's matches for one query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionMatch {
+    pub best: Hit,
+    pub records: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -406,76 +436,86 @@ impl Ord for Worst {
     }
 }
 
-/// Best `limit` hits by weighted score, optionally only the best one per session.
-struct TopHits {
-    limit: usize,
-    unique: bool,
-}
-
-enum Best {
-    Top(BinaryHeap<Worst>),
-    PerSession(HashMap<i64, Hit>),
-}
-
-impl Best {
-    fn push(&mut self, hit: Hit, limit: usize) {
-        match self {
-            Best::Top(heap) => {
-                if heap.len() < limit {
-                    heap.push(Worst(hit));
-                } else if let Some(worst) = heap.peek()
-                    && better(&hit, &worst.0) == Ordering::Greater
-                {
-                    heap.pop();
-                    heap.push(Worst(hit));
-                }
-            }
-            Best::PerSession(map) => match map.get_mut(&hit.sess) {
-                Some(have) if better(&hit, have) != Ordering::Greater => {}
-                Some(have) => *have = hit,
-                None => {
-                    map.insert(hit.sess, hit);
-                }
-            },
-        }
-    }
-
-    fn into_vec(self) -> Vec<Hit> {
-        match self {
-            Best::Top(heap) => heap.into_iter().map(|w| w.0).collect(),
-            Best::PerSession(map) => map.into_values().collect(),
-        }
-    }
-}
-
-struct SegmentTop {
+/// Fast-field columns a collector reads for each matching record.
+struct Columns {
     segment: SegmentOrdinal,
-    best: Best,
-    limit: usize,
     sess: Column<u64>,
     seq: Column<u64>,
     role: Column<u64>,
     ts: Column<i64>,
+    weights: Option<Arc<HashMap<i64, f32>>>,
+}
+
+impl Columns {
+    fn open(
+        segment: SegmentOrdinal,
+        reader: &SegmentReader,
+        weights: Option<Arc<HashMap<i64, f32>>>,
+    ) -> tantivy::Result<Columns> {
+        let fast = reader.fast_fields();
+        Ok(Columns {
+            segment,
+            sess: fast.u64("sess")?,
+            seq: fast.u64("seq")?,
+            role: fast.u64("role")?,
+            ts: fast.i64("ts")?,
+            weights,
+        })
+    }
+
+    /// The record as a hit, its score weighted by role and session.
+    fn hit(&self, doc: DocId, score: Score) -> Hit {
+        let role = self.role.first(doc).unwrap_or(3) as u8;
+        let sess = self.sess.first(doc).unwrap_or(0) as i64;
+        let session_weight = self
+            .weights
+            .as_ref()
+            .and_then(|w| w.get(&sess).copied())
+            .unwrap_or(1.0);
+        Hit {
+            addr: tantivy::DocAddress::new(self.segment, doc),
+            sess,
+            seq: self.seq.first(doc).unwrap_or(0) as u32,
+            score: score * role_weight(role) * session_weight,
+            ts: self.ts.first(doc).unwrap_or(0),
+            role,
+        }
+    }
+}
+
+/// Best `limit` records by weighted score.
+struct TopHits {
+    limit: usize,
+    weights: Option<Arc<HashMap<i64, f32>>>,
+}
+
+struct SegmentTop {
+    columns: Columns,
+    heap: BinaryHeap<Worst>,
+    limit: usize,
+}
+
+fn push_top(heap: &mut BinaryHeap<Worst>, hit: Hit, limit: usize) {
+    if heap.len() < limit {
+        heap.push(Worst(hit));
+    } else if let Some(worst) = heap.peek()
+        && better(&hit, &worst.0) == Ordering::Greater
+    {
+        heap.pop();
+        heap.push(Worst(hit));
+    }
 }
 
 impl SegmentCollector for SegmentTop {
     type Fruit = Vec<Hit>;
 
     fn collect(&mut self, doc: DocId, score: Score) {
-        let role = self.role.first(doc).unwrap_or(3) as u8;
-        let hit = Hit {
-            addr: tantivy::DocAddress::new(self.segment, doc),
-            sess: self.sess.first(doc).unwrap_or(0) as i64,
-            seq: self.seq.first(doc).unwrap_or(0) as u32,
-            score: score * role_weight(role),
-            ts: self.ts.first(doc).unwrap_or(0),
-            role,
-        };
-        self.best.push(hit, self.limit);
+        let hit = self.columns.hit(doc, score);
+        push_top(&mut self.heap, hit, self.limit);
     }
 
     fn harvest(self) -> Vec<Hit> {
-        self.best.into_vec()
+        self.heap.into_iter().map(|w| w.0).collect()
     }
 }
 
@@ -488,19 +528,10 @@ impl Collector for TopHits {
         ord: SegmentOrdinal,
         segment: &SegmentReader,
     ) -> tantivy::Result<SegmentTop> {
-        let fast = segment.fast_fields();
         Ok(SegmentTop {
-            segment: ord,
-            best: if self.unique {
-                Best::PerSession(HashMap::new())
-            } else {
-                Best::Top(BinaryHeap::new())
-            },
+            columns: Columns::open(ord, segment, self.weights.clone())?,
+            heap: BinaryHeap::new(),
             limit: self.limit,
-            sess: fast.u64("sess")?,
-            seq: fast.u64("seq")?,
-            role: fast.u64("role")?,
-            ts: fast.i64("ts")?,
         })
     }
 
@@ -509,18 +540,84 @@ impl Collector for TopHits {
     }
 
     fn merge_fruits(&self, fruits: Vec<Vec<Hit>>) -> tantivy::Result<Vec<Hit>> {
-        let mut best = if self.unique {
-            Best::PerSession(HashMap::new())
-        } else {
-            Best::Top(BinaryHeap::new())
-        };
+        let mut heap = BinaryHeap::new();
         for hit in fruits.into_iter().flatten() {
-            best.push(hit, self.limit);
+            push_top(&mut heap, hit, self.limit);
         }
-        let mut hits = best.into_vec();
+        let mut hits: Vec<Hit> = heap.into_iter().map(|w| w.0).collect();
         hits.sort_by(|a, b| better(b, a));
-        hits.truncate(self.limit);
         Ok(hits)
+    }
+}
+
+/// Every matching session's best record and number of matching records.
+struct SessionCollector {
+    weights: Option<Arc<HashMap<i64, f32>>>,
+}
+
+struct SegmentSessions {
+    columns: Columns,
+    found: HashMap<i64, SessionMatch>,
+}
+
+fn add_match(found: &mut HashMap<i64, SessionMatch>, hit: Hit, records: u32) {
+    match found.get_mut(&hit.sess) {
+        Some(have) => {
+            have.records += records;
+            if better(&hit, &have.best) == Ordering::Greater {
+                have.best = hit;
+            }
+        }
+        None => {
+            found.insert(hit.sess, SessionMatch { best: hit, records });
+        }
+    }
+}
+
+impl SegmentCollector for SegmentSessions {
+    type Fruit = HashMap<i64, SessionMatch>;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        let hit = self.columns.hit(doc, score);
+        add_match(&mut self.found, hit, 1);
+    }
+
+    fn harvest(self) -> HashMap<i64, SessionMatch> {
+        self.found
+    }
+}
+
+impl Collector for SessionCollector {
+    type Fruit = HashMap<i64, SessionMatch>;
+    type Child = SegmentSessions;
+
+    fn for_segment(
+        &self,
+        ord: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<SegmentSessions> {
+        Ok(SegmentSessions {
+            columns: Columns::open(ord, segment, self.weights.clone())?,
+            found: HashMap::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn merge_fruits(
+        &self,
+        fruits: Vec<HashMap<i64, SessionMatch>>,
+    ) -> tantivy::Result<HashMap<i64, SessionMatch>> {
+        let mut fruits = fruits.into_iter();
+        let mut found = fruits.next().unwrap_or_default();
+        for fruit in fruits {
+            for (_, m) in fruit {
+                add_match(&mut found, m.best, m.records);
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -550,7 +647,7 @@ mod tests {
             since_ms: None,
             until_ms: None,
             limit: 10,
-            unique_sessions: false,
+            weights: None,
         }
     }
 
@@ -581,18 +678,30 @@ mod tests {
     }
 
     #[test]
-    fn filters_and_unique_sessions() {
+    fn filters_session_matches_and_weights() {
         let (_dir, ft) = index_with(&[
             (1, 0, 0, 100, "deploy deploy"),
             (1, 1, 1, 200, "deploy"),
             (2, 0, 3, 300, "deploy log"),
             (3, 0, 1, 400, "deploy"),
         ]);
+        let s = spec("deploy");
+        let matches = ft.session_matches(&s, &query_terms("deploy")).unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[&1].records, 2);
+        assert_eq!(
+            matches[&1].best.seq, 0,
+            "user message with two matches is the best"
+        );
+        let best = matches
+            .values()
+            .max_by(|a, b| better(&a.best, &b.best))
+            .unwrap();
+        assert_eq!(best.best.sess, 1);
+        // Session weights scale every record of a session.
         let mut s = spec("deploy");
-        s.unique_sessions = true;
-        let sessions: Vec<i64> = ft.search(&s).unwrap().iter().map(|h| h.sess).collect();
-        assert_eq!(sessions.len(), 3);
-        assert_eq!(sessions[0], 1, "user message with two matches ranks first");
+        s.weights = Some(Arc::new(HashMap::from([(1, 0.01)])));
+        assert_ne!(ft.search(&s).unwrap()[0].sess, 1);
         let only = [2i64, 3];
         let mut s = spec("deploy");
         s.sessions = Some(&only);

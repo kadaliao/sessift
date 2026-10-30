@@ -12,6 +12,7 @@ pub mod fulltext;
 pub mod ingest;
 pub mod project;
 pub mod query;
+pub mod rank;
 pub mod reader;
 pub mod source;
 pub mod store;
