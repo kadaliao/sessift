@@ -150,6 +150,9 @@ pub struct SearchArgs {
     /// Only the best match of each session
     #[arg(long)]
     pub per_session: bool,
+    /// Also match words starting with the last word, as the interactive view does
+    #[arg(long)]
+    pub prefix: bool,
 }
 
 #[derive(Args, Debug)]
@@ -410,6 +413,7 @@ async fn search(ctx: &Ctx, args: SearchArgs) -> Result<i32> {
             .filters
             .build(args.role.clone(), args.session.clone())?,
         unique_sessions: args.per_session,
+        prefix: args.prefix,
     };
     request.validate().map_err(|e| anyhow!(e))?;
     let outcomes = ctx

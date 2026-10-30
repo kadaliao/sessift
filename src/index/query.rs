@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::fulltext::{FullText, Hit, SearchSpec, query_terms};
+use super::fulltext::{FullText, Hit, SearchSpec, prefix_term, query_terms};
 use super::ingest::{self, INDEX_MESSAGE_BYTES, Report};
 use super::rank::{self, Rank};
 use super::source::{self, Kind, Role, Roots};
@@ -183,7 +183,9 @@ impl NativeIndex {
             .into_iter()
             .map(|(id, kind)| (id, rank.kind_weight(Some(&kind))))
             .collect();
+        let prefix = req.prefix.then(|| prefix_term(&req.query)).flatten();
         let spec = SearchSpec {
+            prefix: prefix.as_deref(),
             query: &req.query,
             sessions: sessions.as_deref(),
             role,
@@ -261,7 +263,12 @@ impl NativeIndex {
                     ts_ms: record.ts,
                     record_id: record_id(session.id, &record),
                     role: Role::from_u8(record.role).as_str().into(),
-                    snippet: snippet(body, &req.query, req.snippet_chars as usize),
+                    snippet: snippet(
+                        body,
+                        &req.query,
+                        prefix.as_deref(),
+                        req.snippet_chars as usize,
+                    ),
                     source: session.source,
                     session_id: session.session_id,
                     source_path: session.path,
@@ -507,7 +514,7 @@ pub fn parse_record_id(id: &str) -> Option<(i64, u64, u16)> {
 
 /// About `max_chars` characters around the first place the query matches (by the same
 /// tokenizer the index uses, so stems and Chinese words line up).
-pub fn snippet(text: &str, query: &str, max_chars: usize) -> String {
+pub fn snippet(text: &str, query: &str, prefix: Option<&str>, max_chars: usize) -> String {
     // A match can only lie in the indexed prefix.
     let head = &text[..text.floor_char_boundary(INDEX_MESSAGE_BYTES)];
     let flat = text::collapse_ws(head);
@@ -519,7 +526,10 @@ pub fn snippet(text: &str, query: &str, max_chars: usize) -> String {
         .collect();
     let mut first = None;
     tokenizer::walk(&flat, |token, from, _| {
-        if wanted.iter().any(|w| w == token) || singles.iter().any(|c| token.contains(*c)) {
+        if wanted.iter().any(|w| w == token)
+            || singles.iter().any(|c| token.contains(*c))
+            || prefix.is_some_and(|p| token.starts_with(p))
+        {
             first = Some(from);
             return false;
         }
@@ -571,14 +581,22 @@ mod tests {
             "前".repeat(100),
             "后".repeat(100)
         );
-        let s = snippet(&text, "回滚", 20);
+        let s = snippet(&text, "回滚", None, 20);
         assert!(s.contains("回滚"), "{s}");
         let s = snippet(
             &format!("{} we deployed it", "x ".repeat(200)),
             "deploying",
+            None,
             30,
         );
         assert!(s.contains("deployed"), "{s}");
-        assert_eq!(snippet("short", "nothing", 30), "short");
+        assert_eq!(snippet("short", "nothing", None, 30), "short");
+        let s = snippet(
+            &format!("{} the tantivy index", "x ".repeat(200)),
+            "tanti",
+            Some("tanti"),
+            30,
+        );
+        assert!(s.contains("tantivy"), "{s}");
     }
 }

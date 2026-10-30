@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Search quality evaluation over a private query set.
 
-Usage: scripts/eval.py [--sessift PATH] [--dir DIR] [--env K=V ...] [--save NAME] [--compare NAME] [-v]
+Usage: scripts/eval.py [--sessift PATH] [--dir DIR] [--env K=V ...] [--prefix] [--save NAME]
+                       [--compare NAME] [-v]
 
 The query set holds real session content, so it lives outside the repository, in
 ~/.sessift/eval/ by default:
@@ -42,7 +43,7 @@ def load_jsonl(path):
 
 def search(args, env, query):
     cmd = [args.sessift, "search", *query.split(), "-m", "local", "-n", str(DEPTH),
-           "--per-session", "--format", "jsonl"]
+           "--per-session", "--format", "jsonl"] + (["--prefix"] if args.prefix else [])
     start = time.perf_counter()
     out = subprocess.run(cmd, capture_output=True, text=True, env=env)
     elapsed = (time.perf_counter() - start) * 1000
@@ -75,6 +76,8 @@ def main():
     parser.add_argument("--env", action="append", default=[], metavar="K=V")
     parser.add_argument("--save", metavar="NAME")
     parser.add_argument("--compare", metavar="NAME")
+    parser.add_argument("--prefix", action="store_true",
+                        help="search as the interactive view does while typing")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="list known-item queries that miss the top 10")
     args = parser.parse_args()

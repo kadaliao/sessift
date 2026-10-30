@@ -355,6 +355,7 @@ impl App {
                 snippet_chars: 240,
                 filters,
                 unique_sessions: true,
+                prefix: true,
             })
         };
         self.effects.push(Effect::Fetch {

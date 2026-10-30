@@ -13,8 +13,8 @@ use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::Column;
 use tantivy::merge_policy::{LogMergePolicy, MergeCandidate, MergePolicy};
 use tantivy::query::{
-    BooleanQuery, ConstScoreQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
-    TermSetQuery,
+    BooleanQuery, BoostQuery, ConstScoreQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery,
+    TermQuery, TermSetQuery,
 };
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions,
@@ -295,6 +295,10 @@ impl FullText {
         let f = &self.fields;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for term in terms {
+            if spec.prefix.is_some_and(|p| p.eq_ignore_ascii_case(term)) {
+                clauses.push((Occur::Must, self.prefix_query(term)?));
+                continue;
+            }
             let tokens = tokenizer::tokens(term);
             let query: Box<dyn Query> = match tokens.as_slice() {
                 [] => continue,
@@ -350,6 +354,49 @@ impl FullText {
     }
 }
 
+impl FullText {
+    /// Records with the word itself (stemmed, as indexed) or an indexed word starting with it.
+    fn prefix_query(&self, word: &str) -> Result<Box<dyn Query>> {
+        let f = self.fields.body;
+        let prefix = word.to_ascii_lowercase();
+        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
+        for segment in self.reader.searcher().segment_readers() {
+            let index = segment.inverted_index(f)?;
+            let mut stream = index.terms().range().ge(prefix.as_bytes()).into_stream()?;
+            while stream.advance() {
+                if !stream.key().starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                *counts.entry(stream.key().to_vec()).or_default() += stream.value().doc_freq as u64;
+            }
+        }
+        let mut words: Vec<(Vec<u8>, u64)> = counts.into_iter().collect();
+        words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        words.truncate(PREFIX_EXPANSIONS);
+        // The word as typed counts fully; longer words count less, so that a finished word
+        // ranks as it would without prefix matching.
+        let exact = tokenizer::tokens(&prefix);
+        let term = |t: &str| -> Box<dyn Query> {
+            Box::new(TermQuery::new(
+                Term::from_field_text(f, t),
+                IndexRecordOption::WithFreqs,
+            ))
+        };
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+            exact.iter().map(|t| (Occur::Should, term(t))).collect();
+        for (bytes, _) in words {
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            if !exact.contains(&text) {
+                let longer: Box<dyn Query> = Box::new(BoostQuery::new(term(&text), PREFIX_BOOST));
+                clauses.push((Occur::Should, longer));
+            }
+        }
+        Ok(Box::new(BooleanQuery::new(clauses)))
+    }
+}
+
 /// Split a query into terms: whitespace-separated words, or "quoted phrases".
 pub fn query_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
@@ -379,6 +426,25 @@ pub struct SearchSpec<'a> {
     pub limit: usize,
     /// Score multipliers of sessions (by kind); sessions not in the map count 1.
     pub weights: Option<Arc<HashMap<i64, f32>>>,
+    /// The query term to match as a word prefix as well (see [`prefix_term`]).
+    pub prefix: Option<&'a str>,
+}
+
+/// Most index words an unfinished word expands to, the most common first.
+const PREFIX_EXPANSIONS: usize = 64;
+/// Score weight of a word that only starts with the typed one.
+const PREFIX_BOOST: f32 = 0.5;
+
+/// The word of a query that is matched as a prefix when searching as you type: the last
+/// term, if it is a single ASCII word of two or more characters (Chinese needs no prefix
+/// matching: a lone character already matches inside words).
+pub fn prefix_term(query: &str) -> Option<String> {
+    if query.ends_with('"') {
+        return None;
+    }
+    let last = query_terms(query).pop()?;
+    let word = last.to_ascii_lowercase();
+    (word.len() >= 2 && word.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(word)
 }
 
 /// A session's matches for one query.
@@ -648,6 +714,7 @@ mod tests {
             until_ms: None,
             limit: 10,
             weights: None,
+            prefix: None,
         }
     }
 
@@ -791,6 +858,35 @@ mod tests {
         assert!(segment_sizes(&ft).len() < SMALL_MERGE_COUNT);
         let total: u32 = segment_sizes(&ft).iter().sum();
         assert_eq!(total, (SMALL_SEGMENT_DOCS + 3) * SMALL_MERGE_COUNT as u32);
+    }
+
+    #[test]
+    fn unfinished_last_words_match_as_prefixes() {
+        let (_dir, ft) = index_with(&[
+            (1, 0, 1, 100, "tantivy segments merge"),
+            (2, 0, 1, 101, "running the tests"),
+            (3, 0, 1, 102, "tango"),
+        ]);
+        let with_prefix = |query: &str| {
+            let word = prefix_term(query);
+            let mut s = spec(query);
+            s.prefix = word.as_deref();
+            let mut hits = found(&ft, &s);
+            hits.sort();
+            hits
+        };
+        assert_eq!(with_prefix("tanti"), vec![(1, 0)]);
+        assert_eq!(with_prefix("tan"), vec![(1, 0), (3, 0)]);
+        assert_eq!(with_prefix("segments mer"), vec![(1, 0)]);
+        // A finished word still matches its stem.
+        assert_eq!(with_prefix("tests"), vec![(2, 0)]);
+        assert_eq!(with_prefix("running"), vec![(2, 0)]);
+        // Without prefix matching an unfinished word finds nothing.
+        assert!(found(&ft, &spec("tanti")).is_empty());
+        assert_eq!(prefix_term("deploy 回滚"), None);
+        assert_eq!(prefix_term("x"), None);
+        assert_eq!(prefix_term("\"roll back\""), None);
+        assert_eq!(prefix_term("roll Bac"), Some("bac".into()));
     }
 
     #[test]

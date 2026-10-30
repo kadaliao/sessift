@@ -58,6 +58,10 @@ pub struct SearchRequest {
     /// Return only the best hit of each session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unique_sessions: bool,
+    /// The last word may be unfinished: also match words that start with it (search as you
+    /// type). Older servers ignore it and match whole words.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefix: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,6 +240,7 @@ impl SearchRequest {
             snippet_chars: SNIPPET_CHARS_DEFAULT,
             filters: Filters::default(),
             unique_sessions: false,
+            prefix: false,
         }
     }
 
