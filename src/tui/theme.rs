@@ -43,6 +43,7 @@ pub fn source_color(source: &str) -> Color {
         "codex" => Color::Indexed(110),
         "pi" | "omp" => Color::Indexed(140),
         "opencode" => Color::Indexed(108),
+        "grok" => Color::Indexed(179),
         "cursor" => Color::Indexed(176),
         "copilot" | "antigravity" => Color::Indexed(75),
         "kimi" | "kilocode" => Color::Indexed(117),

@@ -1,6 +1,6 @@
 # 会话记录格式
 
-各来源的格式要点和解析规则，是 `src/index/source/` 的依据。2026-10 在作者的机器上用真实文件核对：Claude Code 2.1.31x、codex-cli 0.164、Pi 1.4、OpenCode 1.19。测试样本在 `tests/fixtures/`，内容全部虚构。
+各来源的格式要点和解析规则，是 `src/index/source/` 的依据。2026-10 在作者的机器上用真实文件核对：Claude Code 2.1.31x、codex-cli 0.164、Pi 1.4、OpenCode 1.19、Grok Build 1.0.62。测试样本在 `tests/fixtures/`，内容全部虚构。
 
 ## 共同约定
 
@@ -9,7 +9,7 @@
 - **记录 ID**：`<会话键>-<偏移>-<序号>`，只要原文件不被改写就保持稳定。
 - **解析约定**：一行产生哪些记录、文字是什么，只能取决于这一行本身。跨行状态只能用来补元数据（工具名、标题、cwd），或者整行跳过。读回记录时，单独重新解析那一行，按序号取对应的记录。测试会对每个样本核对这一点。
 - **未写完的末行**：普通文件里没有换行结尾的最后一行可能还在写，留到下次再解析。压缩文件已经写完，末行照常解析。中间有坏行就跳过并计数。
-- **图片**：图片和 base64 数据永远不进索引。Claude 的工具输出里图片占原始字节的 35%，Codex 占 53%，Pi 占 78%。
+- **图片**：图片和 base64 数据永远不进索引。Claude 的工具输出里图片占原始字节的 35%，Codex 占 53%，Pi 占 78%，Grok 的对话记录里占 57%。
 - **标题**：取第一条真正的用户消息，压成一行，最多 80 字。各来源的例外见下文。
 - **消息数**：用户消息加助手消息的条数。
 
@@ -135,6 +135,51 @@
   - 有变化时，对每个会话算一个签名：会话行，加上 `message` 和 `part` 各自的条数与最大 `time_updated`（约 2ms）。
   - 签名变了的会话整个重读；数据库里没有了的会话删除。
   - `session.time_updated` 不会随新消息更新，不能单靠它判断。
+
+## Grok
+
+- **位置**：`$GROK_HOME` 或 `~/.grok` 下的 `sessions/<URL 编码的 cwd>/<会话 id>/`。
+  - 目录名编码后超过 255 字节时，Grok 改用缩写加哈希，原路径写在这一层的 `.cwd` 文件里。
+  - 会话目录里解析 `chat_history.jsonl`（发给模型的对话），旁边的 `summary.json` 和 `updates.jsonl` 只取元数据。其余文件（`events.jsonl` 是 MCP 启动事件，还有 `prompt_context.json`、`rewind_points.jsonl`、`terminal/`、`*.lock` 等）不读。
+  - 没有 `chat_history.jsonl` 的会话目录跳过。`sessions/session_search.sqlite` 是 Grok 自己的搜索索引，分组目录里的 `prompt_history.jsonl` 是输入历史，都不读。
+- **会话 ID**：会话目录名，和 `summary.json` 的 `info.id` 一致。
+- **`summary.json`**：
+  - cwd 取 `info.cwd`；没有时读 `.cwd`，再没有就把分组目录名做 URL 解码。
+  - 开始时间取 `created_at`，最后活跃取 `updated_at`、`last_active_at` 中较晚的。
+  - Grok 常在写完对话记录之后才更新它（标题、最后活跃时间，晚几秒到一个多小时），所以判断会话有没有变化时，要把它的修改时间算进去。只有它变了时，不重新解析对话记录，只更新会话信息。
+  - 模型 `current_model_id`、分支 `head_branch` 记在会话的附加信息里。
+- **会话种类**（`summary.json`）：
+  - `exec`：`session_kind` 为 `headless`（`grok -p` 跑的单次任务，相当于 `codex exec`）。
+  - `fork`：有 `parent_session_id`（`/fork` 或恢复时另起的会话）。
+  - `subagent`：`session_kind` 里带 `subagent`。按文档，子 agent 是 sessions 目录下的普通会话；两台机器上都还没有 fork 和子 agent 的样本，这两条规则没有用真实文件核对过，fork 开头从父会话继承的部分（`inherited_prefix_len`）目前也没有跳过。
+  - `main`：其余情况。
+- **按 `type` 分派**：
+  - `user`：带 `synthetic_reason` 的是注入的内容，不算用户消息（`system_reminder`、`task_completed` 后台任务通知等）。其余的取 `<user_query>…</user_query>` 里的文字；整行就是 `<user_info>` 这类标签的（环境信息）跳过。
+    - 用户的话都包在 `<user_query>` 里，外面可能还有说明（"The user sent a message while you were working:"）或技能信息（`<skill_information>`），只取里面的。
+  - `assistant`：`content` 是助手记录；`tool_calls` 里每一项是一条工具调用，参数是 JSON 字符串。
+  - `tool_result`：工具结果，工具名通过 `tool_call_id` 找。`images` 里是 base64 的 data URL，每张图只记一个 `[image]`。
+  - `backend_tool_call`：服务端执行的工具（网页搜索）。工具名取 `kind.tool_type`，调用的文字是 `action.query`；`action.sources` 里的网址另记一条工具结果。
+  - `system`（系统提示）、`reasoning`（加密的思考过程）跳过，解析前按行首字节就能跳过。
+- **工具调用的文字**：
+  - `run_terminal_command`、`monitor`：`# 说明` 加命令。
+  - `read_file`：路径，加 `offset`、`limit`。
+  - `search_replace`：路径加 `- 旧` / `+ 新`；`write`：路径加内容。
+  - `grep`：pattern、path、glob；`list_dir`、`web_fetch`、`search_tool`：目录、网址、查询词。
+  - `use_tool`（经网关调用的 MCP 工具）：第一行是真正的工具名，后面每个参数一行。
+  - `spawn_subagent`：说明加提示；`todo_write`、`ask_user_question` 和 Claude 的 TodoWrite、AskUserQuestion 一样。
+  - 其他工具：每个字段一行 `key: value`。
+- **时间**：对话记录里没有逐条时间。
+  - 每条记录用所在轮次的开始时间：带 `prompt_index` 的用户行（包括注入的）开始一轮，时间从 `updates.jsonl` 里同一 `promptIndex` 的 `user_message_chunk` 取（`params._meta.agentTimestampMs`，没有时用秒级的 `timestamp`）。`/rewind` 之后同一个序号可能再出现，取后出现的。
+  - 压缩过的文件开头还没有轮次，用最近一次 `compaction_checkpoint` 的时间；都没有时用会话开始时间。
+  - `updates.jsonl` 每个会话几 MB，入库时只按字节找这两种行再解析，并记住读到的位置，下次接着读。
+- **压缩（`/compact` 或自动）**：
+  - Grok 会改写整个 `chat_history.jsonl`：开头是系统提示，加上 `synthetic_reason` 为 `compaction_meta` 的两行（重发的 `<user_info>` 和压缩摘要），之后是保留下来的内容。
+  - 压缩摘要当作一条助手记录，因为压缩前的对话已经不在文件里了，摘要是唯一的线索。
+  - 压缩前的完整对话还在 `updates.jsonl`（ACP 更新流，只追加，助手消息分块）和 `compaction/segment_*.md`（Markdown）里，目前都不索引。
+- **标题**：`summary.json` 的 `session_summary`（Grok 显示的标题，`/rename` 改的也在这里），没有时用 `generated_title`，再没有时用第一条用户消息。
+- **恢复**：`cd '<cwd>' && grok --resume <id>`。`--resume` 也接受标题，但只在当前目录的会话里找，所以要先进 cwd。子 agent 恢复父会话。
+- **增量**：会话进行中文件只追加，压缩和 `/rewind` 会整文件改写。和其他 JSONL 来源一样核对上次解析位置前 256 字节的指纹，对不上（或文件变短）就整文件重解析。
+- **没有提问的会话**：只打开没提问的会话只有系统提示和注入内容，没有记录，不在列表里（本机 17 个里有 6 个）。
 
 ## Oh My Pi（omp）
 

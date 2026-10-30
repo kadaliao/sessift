@@ -426,6 +426,13 @@ fn scan(roots: &Roots) -> Vec<Found> {
                 size += wal.len();
                 mtime_ns = mtime_ns.max(wal.mtime() * 1_000_000_000 + wal.mtime_nsec());
             }
+            if kind == Kind::Grok
+                && let Ok(summary) = std::fs::metadata(source::grok::summary_path(&path))
+            {
+                // Grok writes the title and last active time to summary.json, often well
+                // after the transcript; a change there alone re-reads it, parsing no lines.
+                mtime_ns = mtime_ns.max(summary.mtime() * 1_000_000_000 + summary.mtime_nsec());
+            }
             Some(Found {
                 kind,
                 size,

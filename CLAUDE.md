@@ -1,6 +1,6 @@
 # sessift
 
-搜索、浏览、恢复 AI 编程助手会话（Claude Code、Codex、Pi、OpenCode 等）的命令行工具，覆盖本机和其他机器。机器之间不同步数据：查询时到各台机器现场查，只传结果。起因是 memex 在多机场景下太慢，见 `docs/plan.md` 的"背景"一节。
+搜索、浏览、恢复 AI 编程助手会话（Claude Code、Codex、Pi、OpenCode、Grok 等）的命令行工具，覆盖本机和其他机器。机器之间不同步数据：查询时到各台机器现场查，只传结果。起因是 memex 在多机场景下太慢，见 `docs/plan.md` 的"背景"一节。
 
 ## 当前状态（2026-10-31）
 
@@ -16,7 +16,7 @@
 | `README.md` | 用法、按键、命令、配置、性能数据 |
 | `docs/plan.md` | 背景、设计原则、路线图、各阶段方案与结果，阶段 2 的详细方案 |
 | `docs/remote-protocol.md` | 远程协议：帧格式、握手、操作、错误码、broker 消息、连接可靠性 |
-| `docs/formats.md` | Claude、Codex、Pi、OpenCode 会话记录的格式要点和解析规则 |
+| `docs/formats.md` | Claude、Codex、Pi、OpenCode、Grok 会话记录的格式要点和解析规则 |
 
 ## 代码地图
 
@@ -78,6 +78,7 @@ scripts/bench.py --sessift target/release/sessift               # 延迟基准
 - **Tantivy 的合并会拖住提交它的那次刷新**：`wait_merging_threads` 要等合并做完，默认策略偶尔合并四分之一的索引。查询里的刷新用 `Merges::Small`，大合并交给 `sessift index`。
 - **zst 文件的"已解析字节"是解压后的大小**，比文件本身大，不能拿来和文件大小比较判断"变短了"。
 - **OpenCode 的变化要看 `-wal` 文件**：提交先写进 WAL，数据库文件要到 checkpoint 才变；`-shm` 读一下也会变，不能用。
+- **Grok 的标题和最后活跃时间在 `summary.json`**，常比对话记录晚几秒到一个多小时才写，所以入库判断变化时把它的修改时间也算上（`ingest.rs` 的 `scan`）。
 - **Claude 和 Codex 的 fork、子 agent 文件开头是复制来的父会话历史**，不跳过会重复命中，规则见 `docs/formats.md`。
 - **开发时别直接索引全部真实数据**：用 `tests/fixtures/home` 或临时 HOME 里的部分文件（`cp -c` 克隆）加临时 `SESSIFT_HOME`，全量只在最后验证性能时跑。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。

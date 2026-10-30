@@ -105,7 +105,7 @@ pub struct MachineSel {
 
 #[derive(Args, Debug)]
 pub struct FilterArgs {
-    /// Only this source (claude, codex, pi, opencode, ...)
+    /// Only this source (claude, codex, pi, opencode, grok)
     #[arg(long)]
     pub source: Option<String>,
     /// Only this project

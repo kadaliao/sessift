@@ -17,6 +17,7 @@ use super::reader;
 
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub mod opencode;
 pub mod pi;
 
@@ -312,10 +313,17 @@ pub enum Kind {
     Codex,
     Pi,
     OpenCode,
+    Grok,
 }
 
 impl Kind {
-    pub const ALL: &'static [Kind] = &[Kind::Claude, Kind::Codex, Kind::Pi, Kind::OpenCode];
+    pub const ALL: &'static [Kind] = &[
+        Kind::Claude,
+        Kind::Codex,
+        Kind::Pi,
+        Kind::OpenCode,
+        Kind::Grok,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -323,6 +331,7 @@ impl Kind {
             Kind::Codex => codex::Codex::SOURCE,
             Kind::Pi => pi::Pi::SOURCE,
             Kind::OpenCode => opencode::SOURCE,
+            Kind::Grok => grok::Grok::SOURCE,
         }
     }
 
@@ -342,6 +351,7 @@ impl Kind {
             Kind::Codex => codex::Codex::VERSION,
             Kind::Pi => pi::Pi::VERSION,
             Kind::OpenCode => opencode::VERSION,
+            Kind::Grok => grok::Grok::VERSION,
         }
     }
 }
@@ -355,6 +365,8 @@ pub struct Roots {
     pub pi: Vec<std::path::PathBuf>,
     /// OpenCode data directories, holding `opencode*.db`.
     pub opencode: Vec<std::path::PathBuf>,
+    /// Grok homes (`~/.grok`), holding `sessions/`.
+    pub grok: Vec<std::path::PathBuf>,
 }
 
 impl Roots {
@@ -365,6 +377,7 @@ impl Roots {
             codex: vec![codex::default_home(home)],
             pi: vec![pi::default_root(home)],
             opencode: opencode::default_roots(home),
+            grok: vec![grok::default_home(home)],
         }
     }
 
@@ -409,6 +422,12 @@ pub fn discover(roots: &Roots) -> Vec<(Kind, std::path::PathBuf)> {
             .opencode
             .iter()
             .map(|r| (Kind::OpenCode, r, opencode::discover as Walk)),
+    );
+    jobs.extend(
+        roots
+            .grok
+            .iter()
+            .map(|r| (Kind::Grok, r, grok::discover as Walk)),
     );
     jobs.par_iter()
         .flat_map_iter(|(kind, root, walk)| {
@@ -459,6 +478,7 @@ pub fn parse_file(kind: Kind, path: &Path, start: u64, state: Option<&str>) -> R
         Kind::Claude => parse_jsonl(&claude::Claude, path, start, prev),
         Kind::Codex => parse_jsonl(&codex::Codex, path, start, prev),
         Kind::Pi => parse_jsonl(&pi::Pi, path, start, prev),
+        Kind::Grok => parse_jsonl(&grok::Grok, path, start, prev),
         Kind::OpenCode => unreachable!("handled above"),
     }?;
     Ok(FileParse {
@@ -483,6 +503,7 @@ pub fn items_of(kind: Kind, line: &[u8]) -> Vec<Item> {
         Kind::Claude => items_of_line(&claude::Claude, line),
         Kind::Codex => items_of_line(&codex::Codex, line),
         Kind::Pi => items_of_line(&pi::Pi, line),
+        Kind::Grok => items_of_line(&grok::Grok, line),
         Kind::OpenCode => Vec::new(),
     }
 }
@@ -536,6 +557,7 @@ pub fn resume_command(
             Some(cwd) => format!("cd {} && opencode --session {session_id}", sh_quote(cwd)),
             None => format!("opencode --session {session_id}"),
         }),
+        Kind::Grok => grok::resume_command(session_id, session_kind, cwd, parent),
     }
 }
 

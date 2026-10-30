@@ -1,0 +1,20 @@
+{
+  "info": {
+    "id": "01a2c3d4-0000-7000-8000-00000000f001",
+    "cwd": "/Users/alice/work/garden-bot"
+  },
+  "session_summary": "Balcony herb watering schedule",
+  "created_at": "2026-03-06T14:00:00.000000Z",
+  "updated_at": "2026-03-06T15:30:00.000000Z",
+  "num_messages": 40,
+  "num_chat_messages": 9,
+  "current_model_id": "grok-build",
+  "next_trace_turn": 6,
+  "chat_format_version": 1,
+  "grok_home": "/Users/alice/.grok",
+  "last_active_at": "2026-03-06T15:30:00.000000Z",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high",
+  "generated_title": "Balcony herb watering schedule"
+}

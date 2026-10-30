@@ -1,6 +1,6 @@
 # sessift
 
-在本机和其他机器上搜索、浏览 AI 编程助手的会话记录（Claude Code、Codex、Pi、OpenCode 等）。
+在本机和其他机器上搜索、浏览 AI 编程助手的会话记录（Claude Code、Codex、Pi、OpenCode、Grok 等）。
 机器之间不同步数据：查询时到每台机器现场查，只把查好的结果传回来。
 
 ```
@@ -35,7 +35,7 @@ $ sessift search 部署 回滚 -n 3
 | 查询前的增量更新，有新记录（正在进行的会话） | 25～35ms |
 | 冷建全量索引 | 12.9 秒，索引 482MB（memex 5GB） |
 
-和 memex 的区别：sessift 也索引 Codex 压缩过的旧会话（`.jsonl.zst`，memex 不读）；原文件已删除的会话不保留；多个搜索词要同时出现在一条记录里（memex 是任一出现）；目前支持 Claude Code、Codex、Pi、OpenCode 四种来源。
+和 memex 的区别：sessift 也索引 Codex 压缩过的旧会话（`.jsonl.zst`，memex 不读）；原文件已删除的会话不保留；多个搜索词要同时出现在一条记录里（memex 是任一出现）；目前支持 Claude Code、Codex、Pi、OpenCode、Grok 五种来源。
 
 ## 安装
 
@@ -172,8 +172,8 @@ cargo fmt --check
 scripts/bench.py --sessift target/release/sessift
 ```
 
-自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致，覆盖 Claude、Codex、Pi、OpenCode），见 `tests/native.rs` 和 `tests/cli.rs` 的 `native_backend_end_to_end`。
+自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致，覆盖 Claude、Codex、Pi、OpenCode、Grok），见 `tests/native.rs` 和 `tests/cli.rs` 的 `native_backend_end_to_end`。
 
-测试共 111 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、自研索引（各来源解析、增量更新、段合并）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
+测试共 120 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、自研索引（各来源解析、增量更新、段合并）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
 
 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。
