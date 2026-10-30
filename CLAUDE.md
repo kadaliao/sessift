@@ -6,7 +6,7 @@
 
 - 已完成：远程查询层、交互界面（Alt-M），阶段 2 自研索引（`src/index/`）。本机和 mm 都已切到 native，和 memex 的延迟、结果集对比做完，memex 适配器已删除。结果见 `docs/plan.md` 的阶段 2。
 - 2026-10-31 本机和 mm 都已卸载 memex（连同 herdr 插件），会话搜索只用 sessift。
-- **下一步**：阶段 3，候选见 `docs/plan.md` 阶段 2 的"留给阶段 3"。
+- **进行中**：阶段 3（搜索质量），分支 `phase3-search-quality`，方案和步骤见 `docs/plan.md` 的"阶段 3"。用户已定：会话列表默认只列对话（隐藏 subagent、guardian、exec）；向量检索等评测结果出来再定。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
 ## 文档
