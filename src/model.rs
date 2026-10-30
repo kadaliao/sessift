@@ -36,7 +36,15 @@ pub struct Filters {
     pub since_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ms: Option<i64>,
+    /// Session kinds, comma-separated: `main`, `subagent`, `fork`, `background`, `exec`,
+    /// `guardian`, or the groups `conversation` (what a person talked to, with at least one
+    /// message) and `all`. Unset: session lists show `conversation`, searches `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
+
+/// Kinds in the `conversation` group; sessions without a kind count as `main`.
+pub const CONVERSATION_KINDS: &[&str] = &["main", "fork", "background"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRequest {

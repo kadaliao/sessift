@@ -229,6 +229,8 @@ pub struct App {
     pub source: Option<String>,
     pub sources_seen: Vec<String>,
     pub range: Range,
+    /// List every session kind instead of only conversations (searches always see all).
+    pub all_kinds: bool,
     pub query: String,
     /// Cursor position in characters.
     pub cursor: usize,
@@ -270,6 +272,7 @@ impl App {
             source: None,
             sources_seen: Vec::new(),
             range: Range::All,
+            all_kinds: false,
             query,
             cursor,
             focus: Focus::Query,
@@ -334,6 +337,7 @@ impl App {
         let filters = Filters {
             source: self.source.clone(),
             since_ms: self.range.since_ms(),
+            kind: self.all_kinds.then(|| "all".to_string()),
             ..Filters::default()
         };
         let query = self.query.trim().to_string();
@@ -645,6 +649,23 @@ impl App {
         self.fetch();
     }
 
+    fn toggle_kinds(&mut self) {
+        if !self.query.trim().is_empty() {
+            self.set_status("搜索本来就包含全部会话");
+            return;
+        }
+        self.all_kinds = !self.all_kinds;
+        self.fetch();
+    }
+
+    pub fn kinds_label(&self) -> &'static str {
+        if self.all_kinds {
+            "全部会话"
+        } else {
+            "对话"
+        }
+    }
+
     pub fn machine_label(&self) -> String {
         match self.machine_choice {
             None => "全部机器".into(),
@@ -842,6 +863,7 @@ impl App {
                 self.fetch();
             }
             KeyCode::Char('m') => self.cycle_machine(),
+            KeyCode::Char('a') => self.toggle_kinds(),
             KeyCode::Char('/') | KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Query,
             KeyCode::Char('q') => self.exit = Some(Exit::Quit),
             KeyCode::Backspace => {
@@ -1139,6 +1161,11 @@ mod tests {
         );
         app.on_key(key(KeyCode::Char('t')));
         assert_eq!(app.range, Range::Day);
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.all_kinds);
+        assert!(
+            matches!(&app.take_effects().last().unwrap(), Effect::Fetch { op: Op::Sessions(req), .. } if req.filters.kind.as_deref() == Some("all"))
+        );
         app.on_key(key(KeyCode::Char('m')));
         assert!(
             matches!(&app.take_effects().last().unwrap(), Effect::Fetch { machines, .. } if machines == &vec!["local".to_string()])

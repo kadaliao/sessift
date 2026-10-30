@@ -109,7 +109,11 @@ impl Backend {
                 }
                 .map_err(failed)?;
                 page.records.truncate(req.limit as usize);
-                text::apply_page_budget(&mut page.records, req.max_chars as usize);
+                let kept = text::fit_page(&mut page.records, req.max_chars as usize);
+                if kept < page.records.len() {
+                    page.records.truncate(kept);
+                    page.next_offset = Some(page.offset + kept as u32);
+                }
                 Ok(Reply::Page(page))
             }
             Op::Context(req) => {

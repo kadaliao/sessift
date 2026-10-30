@@ -149,6 +149,27 @@ fn find_chars(haystack: &[char], needle: &[char]) -> Option<usize> {
 
 /// Enforce a shared character budget across a page, in record order. Records past the budget
 /// keep their metadata with empty text and `truncated = true`.
+/// Fit a page of records into `max_chars`: the record that does not fit is cut and the ones
+/// after it are left for the next page. Returns how many records to keep (at least one).
+pub fn fit_page(records: &mut [RecordView], max_chars: usize) -> usize {
+    let mut remaining = max_chars;
+    for (i, record) in records.iter_mut().enumerate() {
+        let len = char_len(&record.text);
+        if len <= remaining {
+            remaining -= len;
+            continue;
+        }
+        if remaining == 0 && i > 0 {
+            return i;
+        }
+        let (kept, _) = truncate_chars(&record.text, remaining);
+        record.text = kept;
+        record.truncated = true;
+        return i + 1;
+    }
+    records.len()
+}
+
 pub fn apply_page_budget(records: &mut [RecordView], max_chars: usize) {
     let mut remaining = max_chars;
     for record in records {
@@ -167,6 +188,31 @@ pub fn apply_page_budget(records: &mut [RecordView], max_chars: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pages_stop_where_the_budget_runs_out() {
+        let record = |text: &str| RecordView {
+            record_id: String::new(),
+            ts_ms: 0,
+            role: "user".into(),
+            tool_name: None,
+            text: text.into(),
+            total_chars: char_len(text) as u64,
+            truncated: false,
+        };
+        let mut page = vec![record("abcd"), record("efgh"), record("ijkl")];
+        assert_eq!(fit_page(&mut page, 6), 2);
+        assert_eq!(page[1].text, "ef");
+        assert!(page[1].truncated);
+        let mut page = vec![record("abcd"), record("efgh")];
+        assert_eq!(fit_page(&mut page, 4), 1, "nothing left for the second");
+        assert!(!page[0].truncated);
+        let mut page = vec![record("abcdef"), record("g")];
+        assert_eq!(fit_page(&mut page, 3), 1, "the first record is always kept");
+        assert_eq!(page[0].text, "abc");
+        let mut page = vec![record("ab"), record("cd")];
+        assert_eq!(fit_page(&mut page, 10), 2);
+    }
 
     #[test]
     fn truncation_never_splits_characters() {

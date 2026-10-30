@@ -106,11 +106,13 @@ fn chinese_word_mid_sentence_is_found_and_shown_in_place() {
     assert_eq!(pi.session_id, "0190f3a2-1c00-7000-8000-00000000a001");
 }
 
+/// Every session of a source, whatever its kind.
 fn sessions_of(index: &NativeIndex, source: &str) -> Vec<sessift::model::SessionSummary> {
     index
         .sessions(&SessionsRequest {
             filters: Filters {
                 source: Some(source.into()),
+                kind: Some("all".into()),
                 ..Filters::default()
             },
             ..SessionsRequest::default()
@@ -123,6 +125,12 @@ fn sessions_list_with_titles_kinds_and_resume_commands() {
     let env = env();
     let all = env.index.sessions(&SessionsRequest::default()).unwrap();
     assert!(all.windows(2).all(|w| w[0].last_ms >= w[1].last_ms));
+    // By default only conversations: no subagents, nothing without messages.
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|s| matches!(
+        s.kind.as_deref(),
+        None | Some("main" | "fork" | "background")
+    ) && s.message_count.unwrap_or(0) > 0));
 
     let sessions = sessions_of(&env.index, "pi");
     assert_eq!(sessions.len(), 3, "{sessions:#?}");
@@ -379,4 +387,53 @@ fn a_machine_without_transcripts_answers_with_nothing() {
     assert!(search(&index, "回滚").is_empty());
     let sessions = index.sessions(&SessionsRequest::default()).unwrap();
     assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_codex_session_split_over_files_reads_as_one() {
+    let env = env();
+    // Codex continues a long session in a new file with the same id and a `_<id>` suffix.
+    let day = env.home.join(".codex/sessions/2026/03/14");
+    let first = day.join("rollout-2026-03-14T09-30-05-019cf1a2-7b3c-7d10-9e21-4a5b6c7d8e9f.jsonl");
+    std::fs::copy(
+        &first,
+        day.join(
+            "rollout-2026-03-14T09-30-05-019cf1a2-7b3c-7d10-9e21-4a5b6c7d8e9f_019cf1a2-0000-7000-8000-000000000000.jsonl",
+        ),
+    )
+    .unwrap();
+    env.index.refresh(&Options::default()).unwrap();
+    let sid = "019cf1a2-7b3c-7d10-9e21-4a5b6c7d8e9f";
+
+    let files: Vec<_> = sessions_of(&env.index, "codex")
+        .into_iter()
+        .filter(|s| s.session_id == sid)
+        .collect();
+    assert_eq!(files.len(), 1, "one row for both files");
+    let single = files[0].message_count.unwrap();
+
+    let mut req = SearchRequest::new("回滚");
+    req.unique_sessions = true;
+    let hits = env.index.search(&req).unwrap();
+    assert_eq!(hits.iter().filter(|h| h.session_id == sid).count(), 1);
+
+    let mut read = ReadRequest::new(sid);
+    read.limit = 500;
+    read.max_chars = 200_000;
+    let page = env.index.read(&read).unwrap();
+    let total = page.total.unwrap() as usize;
+    assert_eq!(page.records.len(), total);
+    assert!(
+        single > 0 && total.is_multiple_of(2),
+        "both files, one after the other"
+    );
+    let half = total / 2;
+    assert_eq!(page.records[0].text, page.records[half].text);
+    assert_ne!(page.records[0].record_id, page.records[half].record_id);
+    // Paging crosses from one file into the next.
+    read.offset = half as u32 - 1;
+    read.limit = 2;
+    let page = env.index.read(&read).unwrap();
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.next_offset, Some(half as u32 + 1));
 }

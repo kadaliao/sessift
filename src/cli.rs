@@ -120,6 +120,10 @@ pub struct FilterArgs {
     /// Not after (same formats as --since)
     #[arg(long, value_name = "TIME")]
     pub until: Option<String>,
+    /// Session kinds, repeatable: main, subagent, fork, background, exec, guardian, or the
+    /// groups conversation and all [default: conversation for `sessions`, all for `search`]
+    #[arg(long, value_name = "KIND")]
+    pub kind: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -143,6 +147,9 @@ pub struct SearchArgs {
     /// Snippet length in characters
     #[arg(long, default_value_t = model::SNIPPET_CHARS_DEFAULT)]
     pub snippet: u32,
+    /// Only the best match of each session
+    #[arg(long)]
+    pub per_session: bool,
 }
 
 #[derive(Args, Debug)]
@@ -168,7 +175,7 @@ pub struct ReadArgs {
     pub session_id: String,
     #[command(flatten)]
     pub sel: MachineSel,
-    /// Read only this transcript path (when a session id has several)
+    /// Pick the session by transcript path (when a session id is ambiguous)
     #[arg(long, value_name = "SOURCE_PATH")]
     pub path: Option<String>,
     /// Records to skip
@@ -376,6 +383,7 @@ impl FilterArgs {
             session_id,
             since_ms: time(&self.since, "since")?,
             until_ms: time(&self.until, "until")?,
+            kind: (!self.kind.is_empty()).then(|| self.kind.join(",")),
         })
     }
 }
@@ -401,7 +409,7 @@ async fn search(ctx: &Ctx, args: SearchArgs) -> Result<i32> {
         filters: args
             .filters
             .build(args.role.clone(), args.session.clone())?,
-        unique_sessions: false,
+        unique_sessions: args.per_session,
     };
     request.validate().map_err(|e| anyhow!(e))?;
     let outcomes = ctx

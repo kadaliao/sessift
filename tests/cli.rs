@@ -305,7 +305,23 @@ fn page_budget_truncates_long_records() {
         .map(|r| r["text"].as_str().unwrap().chars().count())
         .sum();
     assert!(total <= 300, "{total}");
-    assert_eq!(page["records"][99]["truncated"], true);
+    // The page stops where the budget runs out; the rest is on the next page.
+    let records = page["records"].as_array().unwrap();
+    assert!(records.len() < 100);
+    assert_eq!(records.last().unwrap()["truncated"], true);
+    assert_eq!(page["next_offset"], records.len());
+    let next = env.json(&[
+        "read",
+        "b-1",
+        "-m",
+        "b",
+        "--offset",
+        &records.len().to_string(),
+        "--max-chars",
+        "300",
+    ]);
+    assert_eq!(next["offset"], records.len());
+    assert!(!next["records"][0]["text"].as_str().unwrap().is_empty());
 }
 
 #[test]
@@ -799,7 +815,12 @@ fn native_backend_end_to_end() {
         ]
     );
 
+    // Lists show conversations unless asked for every kind.
     let sessions = run(&["sessions", "-n", "100"]);
+    let rows = sessions["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 2 * 8, "8 conversations per machine");
+    assert!(rows.iter().all(|r| r["kind"] != "subagent"));
+    let sessions = run(&["sessions", "-n", "100", "--kind", "all"]);
     let rows = sessions["results"].as_array().unwrap();
     assert_eq!(rows.len(), 2 * 13, "13 sessions per machine");
     let codex = rows

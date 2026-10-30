@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::model::Filters;
+use crate::model::{CONVERSATION_KINDS, Filters};
 
 /// Bump when the tables change shape; the whole index is rebuilt.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -325,28 +325,70 @@ impl Store {
     }
 
     /// Sessions matching the filters, most recently active first. `since`/`until` apply to
-    /// the last activity.
+    /// the last activity; without a kind or session filter only conversations are listed. A session
+    /// split over several files (Codex) is one row: the newest file, with the first file's
+    /// title and start and the messages of all of them.
     pub fn list_sessions(
         &self,
         filters: &Filters,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionRow>> {
-        let (clause, mut args) = session_where(filters, true);
+        // Looking up one session by id finds it whatever its kind.
+        let default_kind = if filters.session_id.is_some() {
+            "all"
+        } else {
+            "conversation"
+        };
+        let (clause, mut args) = session_where(filters, true, default_kind);
         args.push(rusqlite::types::Value::Integer(limit as i64));
         args.push(rusqlite::types::Value::Integer(offset as i64));
+        // SQLite takes the bare columns from the row holding MAX(last_ms), as long as it is
+        // the only MIN/MAX in the query.
         let sql = format!(
-            "SELECT {SESSION_COLS} FROM sessions {clause}
-             ORDER BY last_ms DESC, id LIMIT ? OFFSET ?"
+            "SELECT {SESSION_COLS}, MAX(last_ms) AS newest, COUNT(*), SUM(messages), SUM(records)
+             FROM sessions {clause}
+             GROUP BY source, session_id
+             ORDER BY newest DESC, id LIMIT ? OFFSET ?"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args), session_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+            let row = session_row(r)?;
+            let files: i64 = r.get(16)?;
+            Ok((row, files, r.get::<_, i64>(17)?, r.get::<_, i64>(18)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut row, files, messages, records) = row?;
+            if files > 1 {
+                row.messages = messages as u64;
+                row.records = records as u64;
+                let parts = self.session_files(&row)?;
+                if let Some(first) = parts.first() {
+                    row.started_ms = first.started_ms;
+                }
+                if let Some(title) = parts.iter().find_map(|p| p.title.clone()) {
+                    row.title = Some(title);
+                }
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// The files of one session in order (several only for Codex), given any of them.
+    pub fn session_files(&self, session: &SessionRow) -> Result<Vec<SessionRow>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE source = ?1 AND session_id = ?2
+             ORDER BY started_ms, id"
+        ))?;
+        let rows = stmt.query_map(params![session.source, session.session_id], session_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Ids of the sessions a search may return, or `None` when no session-level filter is set.
     pub fn session_ids(&self, filters: &Filters) -> Result<Option<Vec<i64>>> {
-        let (clause, args) = session_where(filters, false);
+        let (clause, args) = session_where(filters, false, "all");
         if clause.is_empty() {
             return Ok(None);
         }
@@ -489,37 +531,45 @@ fn record_row(r: &rusqlite::Row) -> rusqlite::Result<RecordRow> {
 
 /// WHERE clause for session-level filters. `with_time` also applies since/until to the last
 /// activity (for listing; searches filter record times instead).
-fn session_where(filters: &Filters, with_time: bool) -> (String, Vec<rusqlite::types::Value>) {
+fn session_where(
+    filters: &Filters,
+    with_time: bool,
+    default_kind: &str,
+) -> (String, Vec<rusqlite::types::Value>) {
     use rusqlite::types::Value;
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
+    if let Some((clause, kinds)) = kind_clause(filters.kind.as_deref().unwrap_or(default_kind)) {
+        parts.push(clause);
+        args.extend(kinds.into_iter().map(Value::Text));
+    }
     if let Some(source) = &filters.source {
-        parts.push("source = ?");
+        parts.push("source = ?".into());
         args.push(Value::Text(source.clone()));
     }
     if let Some(project) = &filters.project {
-        parts.push("project = ?");
+        parts.push("project = ?".into());
         args.push(Value::Text(project.clone()));
     }
     if let Some(cwd) = &filters.cwd {
         let cwd = cwd.trim_end_matches('/');
-        parts.push("(cwd = ? OR substr(cwd, 1, ?) = ?)");
+        parts.push("(cwd = ? OR substr(cwd, 1, ?) = ?)".into());
         let prefix = format!("{cwd}/");
         args.push(Value::Text(cwd.to_string()));
         args.push(Value::Integer(prefix.len() as i64));
         args.push(Value::Text(prefix));
     }
     if let Some(sid) = &filters.session_id {
-        parts.push("session_id = ?");
+        parts.push("session_id = ?".into());
         args.push(Value::Text(sid.clone()));
     }
     if with_time {
         if let Some(since) = filters.since_ms {
-            parts.push("last_ms >= ?");
+            parts.push("last_ms >= ?".into());
             args.push(Value::Integer(since));
         }
         if let Some(until) = filters.until_ms {
-            parts.push("last_ms <= ?");
+            parts.push("last_ms <= ?".into());
             args.push(Value::Integer(until));
         }
     }
@@ -528,6 +578,44 @@ fn session_where(filters: &Filters, with_time: bool) -> (String, Vec<rusqlite::t
     } else {
         (format!("WHERE {}", parts.join(" AND ")), args)
     }
+}
+
+/// SQL for a kind filter (see `Filters::kind`) and its arguments; `None` admits every kind.
+fn kind_clause(spec: &str) -> Option<(String, Vec<String>)> {
+    let mut named: Vec<String> = Vec::new();
+    let mut conversation = false;
+    for kind in spec.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        match kind {
+            "all" => return None,
+            "conversation" => conversation = true,
+            other => named.push(other.to_string()),
+        }
+    }
+    let mut ors = Vec::new();
+    if conversation {
+        let marks = vec!["?"; CONVERSATION_KINDS.len()].join(", ");
+        ors.push(format!(
+            "((kind IS NULL OR kind IN ({marks})) AND messages > 0)"
+        ));
+    }
+    if !named.is_empty() {
+        let marks = vec!["?"; named.len()].join(", ");
+        let null = if named.iter().any(|k| k == "main") {
+            "kind IS NULL OR "
+        } else {
+            ""
+        };
+        ors.push(format!("({null}kind IN ({marks}))"));
+    }
+    if ors.is_empty() {
+        return None;
+    }
+    let mut args: Vec<String> = Vec::new();
+    if conversation {
+        args.extend(CONVERSATION_KINDS.iter().map(|k| k.to_string()));
+    }
+    args.extend(named);
+    Some((format!("({})", ors.join(" OR ")), args))
 }
 
 #[cfg(test)]
@@ -544,6 +632,7 @@ mod tests {
             cwd: Some(cwd.into()),
             project: "shop".into(),
             last_ms: last,
+            messages: 1,
             ..SessionRow::default()
         }
     }
@@ -583,6 +672,92 @@ mod tests {
         assert_eq!(store.session_ids(&ranged).unwrap(), None);
         ranged.session_id = Some("c".into());
         assert_eq!(store.session_ids(&ranged).unwrap(), Some(vec![3]));
+    }
+
+    #[test]
+    fn lists_show_conversations_unless_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("x.sqlite")).unwrap().unwrap();
+        let with = |id: i64, kind: Option<&str>, messages: u64| SessionRow {
+            kind: kind.map(str::to_string),
+            messages,
+            ..session(id, &format!("s{id}"), 100 - id, "/w")
+        };
+        store.put_session(&with(1, None, 3)).unwrap();
+        store.put_session(&with(2, Some("main"), 3)).unwrap();
+        store.put_session(&with(3, Some("exec"), 3)).unwrap();
+        store.put_session(&with(4, Some("subagent"), 3)).unwrap();
+        store.put_session(&with(5, Some("fork"), 0)).unwrap();
+        store.put_session(&with(6, Some("guardian"), 3)).unwrap();
+        let ids = |kind: Option<&str>| {
+            let filters = Filters {
+                kind: kind.map(str::to_string),
+                ..Filters::default()
+            };
+            store
+                .list_sessions(&filters, 10, 0)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(None), vec![1, 2]);
+        assert_eq!(ids(Some("conversation")), vec![1, 2]);
+        assert_eq!(ids(Some("all")), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(ids(Some("exec, guardian")), vec![3, 6]);
+        assert_eq!(ids(Some("main")), vec![1, 2]);
+        assert_eq!(ids(Some("conversation,subagent")), vec![1, 2, 4]);
+        assert_eq!(ids(Some("nonsense")), Vec::<i64>::new());
+        let by_id = Filters {
+            session_id: Some("s3".into()),
+            ..Filters::default()
+        };
+        assert_eq!(store.list_sessions(&by_id, 10, 0).unwrap().len(), 1);
+        // Searches see every kind unless told otherwise.
+        assert_eq!(store.session_ids(&Filters::default()).unwrap(), None);
+        let exec = Filters {
+            kind: Some("exec".into()),
+            ..Filters::default()
+        };
+        assert_eq!(store.session_ids(&exec).unwrap(), Some(vec![3]));
+    }
+
+    #[test]
+    fn a_session_split_over_files_is_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("x.sqlite")).unwrap().unwrap();
+        let part = |id: i64, started: i64, last: i64, title: &str, messages: u64| SessionRow {
+            source: "codex".into(),
+            started_ms: Some(started),
+            title: Some(title.into()),
+            messages,
+            records: messages * 2,
+            path: format!("/t/{id}.jsonl"),
+            ..session(id, "split", last, "/w")
+        };
+        store
+            .put_session(&part(1, 10, 19, "first question", 1))
+            .unwrap();
+        store.put_session(&part(2, 20, 29, "later", 4)).unwrap();
+        store.put_session(&part(3, 30, 39, "latest", 5)).unwrap();
+        store.put_session(&session(4, "other", 25, "/w")).unwrap();
+        let rows = store.list_sessions(&Filters::default(), 10, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        let merged = &rows[0];
+        assert_eq!(merged.id, 3, "the newest file stands for the session");
+        assert_eq!(merged.path, "/t/3.jsonl");
+        assert_eq!(merged.title.as_deref(), Some("first question"));
+        assert_eq!(merged.started_ms, Some(10));
+        assert_eq!(merged.last_ms, 39);
+        assert_eq!(merged.messages, 10);
+        assert_eq!(rows[1].id, 4);
+        let files: Vec<i64> = store
+            .session_files(&rows[0])
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(files, vec![1, 2, 3]);
     }
 
     #[test]

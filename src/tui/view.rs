@@ -189,6 +189,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         ]
     };
     let mut right = Vec::new();
+    if app.query.trim().is_empty() {
+        right.extend(chip("a", app.kinds_label().to_string(), app.all_kinds));
+        right.push(Span::raw("   "));
+    }
     right.extend(chip("m", app.machine_label(), app.machine_choice.is_some()));
     right.push(Span::raw("   "));
     right.extend(chip("s", app.source_label(), app.source.is_some()));
@@ -497,7 +501,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Tab", "分栏"),
             ("o", "全文"),
             ("y/Y", "复制ID/命令"),
-            ("s/t/m", "来源/时间/机器"),
+            ("s/t/m/a", "来源/时间/机器/种类"),
             ("/", "搜索"),
             ("q", "退出"),
         ]),

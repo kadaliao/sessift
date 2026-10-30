@@ -19,6 +19,10 @@ use crate::model::{
 };
 use crate::text;
 
+/// Extra hits a per-session search asks for, to make up for sessions split over several
+/// files that collapse into one.
+const SPLIT_SLACK: usize = 16;
+
 pub struct NativeIndex {
     paths: IndexPaths,
     roots: Roots,
@@ -177,7 +181,8 @@ impl NativeIndex {
             role,
             since_ms: req.filters.since_ms,
             until_ms: req.filters.until_ms,
-            limit: req.limit as usize,
+            // A session split over several files may come back once per file.
+            limit: req.limit as usize + if req.unique_sessions { SPLIT_SLACK } else { 0 },
             unique_sessions: req.unique_sessions,
         })?;
         let stored = open.ft.stored_texts(&hits);
@@ -194,6 +199,13 @@ impl NativeIndex {
             };
             found.push((hit.score, session, record, text));
         }
+        if req.unique_sessions {
+            let mut seen = std::collections::HashSet::new();
+            found.retain(|(_, session, _, _)| {
+                seen.insert((session.source.clone(), session.session_id.clone()))
+            });
+        }
+        found.truncate(req.limit as usize);
         // Without a stored copy, read snippets from the transcripts.
         let mut texts: HashMap<(i64, u32), String> = HashMap::new();
         let mut by_session: HashMap<i64, (&SessionRow, Vec<&RecordRow>)> = HashMap::new();
@@ -273,14 +285,36 @@ impl NativeIndex {
                 records: Vec::new(),
             });
         };
-        let rows = open.store.records(session.id, req.offset, req.limit)?;
-        let end = req.offset as u64 + rows.len() as u64;
-        let records = views(&session, &rows, req.max_chars as usize)?;
+        // A session split over several files (Codex) reads as one, file after file.
+        let files = open.store.session_files(&session)?;
+        let files = if files.len() > 1 {
+            files
+        } else {
+            vec![session.clone()]
+        };
+        let total: u64 = files.iter().map(|f| f.records).sum();
+        let mut skip = req.offset as u64;
+        let mut want = req.limit;
+        let mut records = Vec::new();
+        for file in &files {
+            if want == 0 {
+                break;
+            }
+            if skip >= file.records {
+                skip -= file.records;
+                continue;
+            }
+            let rows = open.store.records(file.id, skip as u32, want)?;
+            skip = 0;
+            want = want.saturating_sub(rows.len() as u32);
+            records.extend(views(file, &rows, req.max_chars as usize)?);
+        }
+        let end = req.offset as u64 + records.len() as u64;
         Ok(Page {
             session_id: session.session_id.clone(),
             offset: req.offset,
-            total: Some(session.records as u32),
-            next_offset: (end < session.records).then_some(end as u32),
+            total: Some(total as u32),
+            next_offset: (end < total).then_some(end as u32),
             source_path: session.path,
             records,
         })
