@@ -82,7 +82,7 @@ fn search(index: &NativeIndex, query: &str) -> Vec<sessift::model::SearchHit> {
 fn chinese_word_mid_sentence_is_found_and_shown_in_place() {
     let env = env();
     let hits = search(&env.index, "回滚");
-    for source in ["claude", "codex", "pi", "opencode"] {
+    for source in ["claude", "codex", "pi", "opencode", "grok"] {
         let hit = hits
             .iter()
             .find(|h| h.source == source && h.snippet.contains("在那之前回滚还来得及"))
@@ -238,7 +238,7 @@ fn appended_rewritten_and_deleted_transcripts_are_picked_up() {
 fn rebuild_starts_from_scratch() {
     let env = env();
     let first = env.index.refresh(&Options::default()).unwrap().unwrap();
-    assert_eq!(first.files_parsed, 11);
+    assert_eq!(first.files_parsed, 15);
     let again = env
         .index
         .refresh(&Options {
@@ -248,7 +248,7 @@ fn rebuild_starts_from_scratch() {
         .unwrap()
         .unwrap();
     assert!(again.rebuilt);
-    assert_eq!(again.files_parsed, 11);
+    assert_eq!(again.files_parsed, 15);
     assert!(!search(&env.index, "回滚").is_empty());
 }
 
@@ -364,6 +364,112 @@ fn opencode_sessions_follow_the_database() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].source, "opencode");
     assert!(hits[0].snippet.contains("zebrafish"));
+}
+
+const GROK_MAIN: &str = "01a2c3d4-0000-7000-8000-00000000e001";
+
+fn grok_session(home: &Path) -> PathBuf {
+    home.join(".grok/sessions/%2FUsers%2Falice%2Fwork%2Fweather-cli")
+        .join(GROK_MAIN)
+}
+
+fn append(path: &Path, line: &str) {
+    let mut text = std::fs::read_to_string(path).unwrap();
+    text.push_str(line);
+    text.push('\n');
+    std::fs::write(path, text).unwrap();
+}
+
+#[test]
+fn grok_sessions_follow_their_transcript_and_summary() {
+    let env = env();
+    let sessions = sessions_of(&env.index, "grok");
+    assert_eq!(
+        sessions.len(),
+        3,
+        "a session without a prompt is not listed: {sessions:#?}"
+    );
+    let main = sessions.iter().find(|s| s.session_id == GROK_MAIN).unwrap();
+    assert_eq!(main.title.as_deref(), Some("Cache forecast responses"));
+    assert_eq!(main.project, "weather-cli");
+    assert_eq!(main.kind.as_deref(), Some("main"));
+    assert_eq!(main.message_count, Some(7));
+    assert_eq!(main.started_ms, Some(1_772_697_600_000));
+    assert_eq!(main.last_ms, 1_772_698_350_000);
+    assert_eq!(
+        main.resume_cmd.as_deref(),
+        Some(format!("cd /Users/alice/work/weather-cli && grok --resume {GROK_MAIN}").as_str())
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s.kind.as_deref() == Some("exec") && s.title.is_some())
+    );
+
+    // Grok renames a session in summary.json alone: picked up without parsing the transcript.
+    let dir = grok_session(&env.home);
+    let summary = std::fs::read_to_string(dir.join("summary.json"))
+        .unwrap()
+        .replace(
+            "\"session_summary\": \"Cache forecast responses\"",
+            "\"session_summary\": \"天气缓存\"",
+        );
+    std::fs::write(dir.join("summary.json"), summary).unwrap();
+    let report = env.index.refresh(&Options::default()).unwrap().unwrap();
+    assert_eq!(
+        (report.files_parsed, report.records_added),
+        (1, 0),
+        "{report:?}"
+    );
+    let renamed = sessions_of(&env.index, "grok")
+        .into_iter()
+        .find(|s| s.session_id == GROK_MAIN)
+        .unwrap();
+    assert_eq!(renamed.title.as_deref(), Some("天气缓存"));
+
+    // A new prompt: only it is parsed, and its time comes from updates.jsonl.
+    append(
+        &dir.join("updates.jsonl"),
+        r#"{"timestamp":1772699000,"method":"session/update","params":{"sessionId":"01a2c3d4-0000-7000-8000-00000000e001","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"zebrafish 的数据也缓存吗"},"_meta":{"promptIndex":4}},"_meta":{"agentTimestampMs":1772699000000}}}"#,
+    );
+    append(
+        &dir.join("chat_history.jsonl"),
+        r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nzebrafish 的数据也缓存吗\n</user_query>"}],"prompt_index":4}"#,
+    );
+    let report = env.index.refresh(&Options::default()).unwrap().unwrap();
+    assert_eq!(report.records_added, 1, "{report:?}");
+    assert_eq!(search(&env.index, "zebrafish").len(), 1);
+    let mut req = ReadRequest::new(GROK_MAIN);
+    req.offset = 19;
+    let page = env.index.read(&req).unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].text, "zebrafish 的数据也缓存吗");
+    assert_eq!(page.records[0].ts_ms, 1_772_699_000_000);
+
+    // Compaction rewrites the transcript: it is parsed again, and what it dropped leaves
+    // the index (the summary that replaces it is searchable).
+    std::fs::write(
+        dir.join("chat_history.jsonl"),
+        concat!(
+            r#"{"type":"system","content":"You are Grok."}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"This session is being continued from a previous conversation. Summary: forecast caching is done; starfish data is next."}],"synthetic_reason":"compaction_meta"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    env.index.refresh(&Options::default()).unwrap().unwrap();
+    let grok_hits = |query: &str| {
+        search(&env.index, query)
+            .into_iter()
+            .filter(|h| h.source == "grok")
+            .collect::<Vec<_>>()
+    };
+    assert!(grok_hits("zebrafish").is_empty());
+    assert!(grok_hits("回滚").is_empty());
+    let hits = grok_hits("starfish");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].role, "assistant");
 }
 
 #[test]

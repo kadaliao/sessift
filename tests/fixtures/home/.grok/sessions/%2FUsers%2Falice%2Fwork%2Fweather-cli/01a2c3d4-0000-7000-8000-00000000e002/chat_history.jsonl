@@ -1,0 +1,6 @@
+{"type":"system","content":"You are Grok, an autonomous agent that completes software tasks."}
+{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: macos\nShell: /bin/zsh\nWorkspace Path: /Users/alice/work/weather-cli\nToday's date: 2026-03-05\n</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nSummarise CHANGELOG.md in one line\n</user_query>"}],"prompt_index":0}
+{"type":"assistant","content":"","tool_calls":[{"id":"call_b1","name":"read_file","arguments":"{\"target_file\":\"/Users/alice/work/weather-cli/CHANGELOG.md\"}"}],"model_id":"grok-build","model_fingerprint":"fp_0001","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"call_b1","content":"## 2.3.0\n- Cache forecasts for ten minutes\n- Drop Python 3.8 support"}
+{"type":"assistant","content":"2.3.0 caches forecasts for ten minutes and drops Python 3.8.","model_id":"grok-build","model_fingerprint":"fp_0001","reasoning_effort":"high"}

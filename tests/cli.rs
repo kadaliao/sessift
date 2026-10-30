@@ -790,10 +790,12 @@ fn native_backend_end_to_end() {
         [
             "far:claude",
             "far:codex",
+            "far:grok",
             "far:opencode",
             "far:pi",
             "local:claude",
             "local:codex",
+            "local:grok",
             "local:opencode",
             "local:pi"
         ]
@@ -801,7 +803,7 @@ fn native_backend_end_to_end() {
 
     let sessions = run(&["sessions", "-n", "100"]);
     let rows = sessions["results"].as_array().unwrap();
-    assert_eq!(rows.len(), 2 * 13, "13 sessions per machine");
+    assert_eq!(rows.len(), 2 * 16, "16 sessions per machine");
     let codex = rows
         .iter()
         .find(|r| r["machine"] == "far" && r["source"] == "codex" && r["kind"] == "main")
@@ -827,5 +829,5 @@ fn native_backend_end_to_end() {
         .iter()
         .map(|s| s["source"].as_str().unwrap())
         .collect();
-    assert_eq!(sources, ["claude", "codex", "opencode", "pi"]);
+    assert_eq!(sources, ["claude", "codex", "grok", "opencode", "pi"]);
 }
