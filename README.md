@@ -1,201 +1,198 @@
 # sessift
 
-在本机和其他机器上搜索、浏览 AI 编程助手的会话记录（Claude Code、Codex、Pi、OpenCode、Grok 等）。
-机器之间不同步数据：查询时到每台机器现场查，只把查好的结果传回来。
+在本机和其他机器上，一起搜索、浏览、恢复 AI 编程助手的会话：Claude Code、Codex、Pi、OpenCode、Grok。
 
-```
-$ sessift search 部署 回滚 -n 3
- 41.2  2026-09-20 18:29  local  claude  shop-api      assistant  7c1e9a02-…
-       …灰度发布到 10% 流量，观察错误率；有问题用 `make rollback` 一键回滚 …
- 33.8  2026-06-15 12:03  mm     codex   infra-notes   assistant  0b5d77f4-…
-       把部署脚本、健康检查和回滚步骤整理成一页手册。
-```
+![搜索"回滚"：左边是命中的会话，右边预览命中的那条消息](docs/images/search.png)
 
-当前进度：远程查询层、交互界面、自研索引（阶段 2）和搜索质量（阶段 3，向量检索待定）已完成，默认后端是自研索引，不再需要 memex。路线图见 [docs/plan.md](docs/plan.md)，新会话先读 [CLAUDE.md](CLAUDE.md)。
-
-## 性能
-
-本机 MacBook + Mac mini（往返约 25ms、带宽 30～500KB/s），两台机器都用自研索引，命令行从启动到结束，每项 20 次取中位数（sessift 是 2026-10-31 阶段 3 的版本；memex 是卸载前测的）：
-
-| 场景 | memex 0.31.1 | sessift |
-|---|---|---|
-| 搜索，本机 + 远端 | 2171ms | 29ms |
-| 搜索，只查远端 | 2198ms | 45ms |
-| 搜索，只查本机 | 87ms | 21ms |
-| 50 个会话，本机 + 远端 | 624ms | 30ms |
-| 搜索，只查远端，不经 broker | — | 168ms |
-
-用 `scripts/bench.py` 复现（装了 memex 时同时测它）。
-
-自研索引（本机全量 9.7GB、47 万条记录）：
-
-| 场景 | 耗时 |
-|---|---|
-| 查询前的增量检查，没有变化 | 约 19ms |
-| 查询前的增量更新，有新记录（正在进行的会话） | 25～35ms |
-| 冷建全量索引 | 8.8 秒，索引 462MB（memex 5GB） |
-
-和 memex 的区别：sessift 也索引 Codex 压缩过的旧会话（`.jsonl.zst`，memex 不读）；原文件已删除的会话不保留；多个搜索词要在同一个会话里都出现（memex 是任一出现）；目前支持 Claude Code、Codex、Pi、OpenCode、Grok 五种来源。
-
-## 搜索和列表
-
-- **按会话排序。** 交互界面每个会话只显示最相关的一条。会话的分数从最好的一条记录出发（用户消息高于助手消息，高于工具调用和输出），命中的记录越多、标题里有搜索词、最近活跃过，分数越高。
-- **多个词**：同一条记录里都出现的排前面；分散在同一会话不同记录里的也能搜到，分数打折。
-- **自动线程排后面**：Codex 的 guardian（自动审批复核）、`codex exec`、`grok -p` 这类脚本跑的会话，以及子 agent，搜索时分数打折；会话列表默认不列它们，只列人对话过的会话（`--kind all` 或界面里按 `a` 显示全部）。
-- **边打字边搜**：交互界面里最后一个英文词没打完也能匹配（`tanti` 找到 `tantivy`）。
-- Codex 分成多个文件的长会话在列表和搜索里是一行，阅读时接起来读。
+- **快**：本机加一台远端机器一起搜，从敲下命令到出结果 29 毫秒，和一次网络往返（约 25 毫秒）差不多。
+- **数据不用同步**：会话留在各自的机器上，查询时到每台机器现场查，只把结果传回来。能 `ssh` 上去就行。
+- **中英文全文搜索**：边打字边搜，按会话排序，每个会话只显示最相关的一条。
+- **找到就能接着干**：Enter 直接恢复会话，远端的会话自动 `ssh -t` 过去。
+- **索引小而快**：47 万条记录（9.7GB 会话记录）8.8 秒建完索引，索引只有 462MB；之后查询前自动增量更新，没有新记录时只花约 19 毫秒。
+- **只读**：不改动任何会话文件，索引放在 `~/.sessift`。
 
 ## 安装
 
+macOS（Apple Silicon）从 [Releases](https://github.com/kadaliao/sessift/releases) 下载 `sessift-<版本>-aarch64-apple-darwin.tar.gz`，解压后把 `sessift` 放进 `PATH`：
+
 ```sh
-cargo build --release
-cp target/release/sessift ~/.local/bin/    # 或其他 PATH 目录
-sessift init                               # 生成 ~/.sessift/config.toml，从 ~/.memex/config.toml 导入机器
-sessift remote install mm                  # 把同一个二进制装到远端 ~/.sessift/bin/sessift
-sessift doctor                             # 检查连接、版本、延迟
+tar xzf sessift-*-aarch64-apple-darwin.tar.gz
+install -m 755 sessift ~/.local/bin/sessift
 ```
 
-远端机器需要能用 `ssh <别名>` 免密登录。每台机器第一次被查询时会在后台建索引（几秒到十几秒），之后查询前自动增量更新；也可以手动 `sessift index`。
-`remote install` 要求两边是同一平台（如都是 Darwin arm64）；远端已是同一份二进制时跳过上传。
+用浏览器下载时 macOS 可能拦截这个未签名的程序，执行 `xattr -d com.apple.quarantine sessift` 后再运行。
 
-## 交互界面（Alt-M，或直接运行 `sessift`）
+其他平台用 Rust 从源码安装：
 
-交互方式参考 memex 的 TUI：打字就是搜索，↓ 或 Enter 进入列表，列表里单个字母就是命令。筛选在搜索框里用 Alt 加同一个字母，不用先进列表。鼠标也能完成全部操作。
-
-```
- ▌
- ▌   部署
- ▌
- 匹配 42   ● local 30   ● mm 12                         m 全部机器 ▾   s 全部来源 ▾   t 全部时间 ▾
- ▌ 1mo ● claude   mm     blog            帮我把博客部署到 Vercel，用 GitHub 自动构建…
-   4mo ● codex    mm     infra-notes     把部署脚本、健康检查和回滚步骤整理成一页手册。
-    1d ● claude   local  shop-api        灰度发布到 10% 流量，观察错误率；有问题一键回滚。
+```sh
+cargo install --git https://github.com/kadaliao/sessift --locked
 ```
 
-| 位置 | 按键 | 作用 |
-|---|---|---|
-| 搜索框 | 输入 | 全文搜索（每个会话只显示最相关的一条，最后一个词按前缀匹配）；为空时列出最近的对话 |
-| 搜索框 | ↓ / Enter | 进入列表 |
-| 搜索框 | Tab | 打开右侧分栏预览并进入列表 |
-| 搜索框 | Esc | 清空搜索；再按一次退出 |
-| 任意 | Alt-s / Alt-t / Alt-m / Alt-a | 切换筛选，在搜索框里也能用（状态行的按键提示跟着焦点变） |
-| 列表 | Enter / r | 恢复会话（远端会话自动 `ssh -t`） |
-| 列表 | e | 只把恢复命令放到命令行，不执行 |
-| 列表 | Space | 速览浮层（n/p 切换上下条） |
-| 列表 | Tab | 开关右侧分栏预览（J/K 滚动预览） |
-| 列表 | o / → | 全文阅读：j/k 滚动，d/u 半页，g/G 首尾，/ 查找，n/N 跳转，t 展开工具输出 |
-| 列表 | y / Y | 复制会话 ID / 恢复命令 |
-| 列表 | s / t / m | 切换来源 / 时间范围 / 机器筛选 |
-| 列表 | a | 会话列表在"对话"和"全部会话"（含子 agent、guardian、exec）之间切换 |
-| 列表 | / 或直接打字 | 回到搜索框 |
-| 列表 | Ctrl-R | 刷新 |
-| 任意 | 鼠标 | 见下 |
+然后：
 
-鼠标：
-
-- 单击会话选中，双击恢复（和 Enter 一样）。
-- 滚轮滚动鼠标下面的东西：列表里移动选中项，分栏预览、速览浮层、全文阅读里滚动内容。
-- 单击状态行的筛选（如"全部来源 ▾"）弹出下拉菜单，单击选项生效；点别处关闭。菜单开着时也可以用 ↑/↓、Enter、Esc。
-- 底部的按键提示和速览浮层边框上的提示可以点，效果等于按那个键。
-- 单击搜索框回到输入，光标落在点的位置；点速览浮层外面关闭浮层。
-
-- 预览：搜索结果直接定位到命中的那条消息；普通会话显示开头和结尾；对话按 Markdown 排版，工具调用折叠显示。
-- 多台机器同时查询，先到先显示，慢机器不拖累；状态行显示每台机器的条数或错误。
-- Alt 组合键要求终端把 Option 当 Alt 发送（Ghostty 的 `macos-option-as-alt = true`，iTerm2 的 Esc+），Alt-M 快捷键同样需要。
-- 从快捷键打开时，Enter 会把恢复命令交给 shell 执行（会进入 shell 历史）；直接运行 `sessift` 时，Enter 直接执行。
-
-启用快捷键（fish 放进 `fish_user_key_bindings` 函数里）：
-
-```fish
-command -q sessift; and sessift shell fish | source   # fish
-eval "$(sessift shell zsh)"                            # zsh
-eval "$(sessift shell bash)"                           # bash（只放到命令行，不自动执行）
+```sh
+sessift init     # 生成配置 ~/.sessift/config.toml
+sessift          # 打开交互界面
 ```
 
-换键：`sessift shell fish --key ctrl-o`。
+第一次运行会先建索引，会话多时要几秒到十几秒。
 
-## 命令
+## 交互界面
 
-| 命令 | 作用 |
+运行 `sessift`，打字就是搜索；搜索框为空时列出最近的会话。按 ↓ 或 Enter 进入列表，列表里单个字母就是命令。
+
+![最近的会话；单击状态行的筛选弹出下拉菜单](docs/images/menu.png)
+
+| 按键 | 作用 |
 |---|---|
-| `sessift search <词…>` | 搜索。`-m` 选机器（可重复，`all` 表示全部），`-n` 条数，`--source`、`--project`、`--cwd`、`--role`、`--session`、`--kind`、`--since`、`--until` 过滤；`--per-session` 每个会话一条，`--prefix` 最后一个词按前缀匹配 |
-| `sessift sessions` | 按最后活跃时间列会话，`-n`、`--offset` 翻页。默认只列对话，`--kind`（可重复：`main`、`subagent`、`fork`、`background`、`exec`、`guardian`，或 `conversation`、`all`）改变 |
-| `sessift read <会话 ID>` | 分页读正文。不带 `-m` 时自动在各机器上找这个会话；`--offset`、`-n`、`--max-chars` |
-| `sessift`、`sessift pick` | 交互界面：搜索、预览、阅读、恢复会话 |
-| `sessift shell fish\|zsh\|bash` | 输出快捷键绑定脚本 |
-| `sessift machines` | 列出机器，测连通性、延迟和远端版本 |
-| `sessift doctor` | 逐项诊断：后端、全新 SSH 握手耗时、往返延迟、样例查询耗时和传输量、broker 状态 |
-| `sessift remote install <机器…>` | 安装或更新远端二进制 |
-| `sessift broker status` / `stop` | 查看或停止后台 broker |
-| `sessift index` | 建立或增量更新本机索引；`--rebuild` 重建，`index stats` 看各来源会话数、索引大小和待处理文件 |
+| ↓ / Enter | 从搜索框进入列表 |
+| Enter | 恢复选中的会话 |
+| e | 把恢复命令放到命令行，不执行 |
+| Space | 速览（n/p 切换上下条） |
+| Tab | 开关右侧分栏预览 |
+| o | 全文阅读 |
+| s / t / m / a | 切换来源、时间、机器、会话种类；在搜索框里用 Alt-s / Alt-t / Alt-m / Alt-a |
+| y / Y | 复制会话 ID / 恢复命令 |
+| / 或 Esc | 回到搜索框 |
+| Esc（搜索框里） | 清空搜索，再按一次退出 |
 
-时间参数支持 `7d`、`12h`、`2026-10-01`、`2026-10-01 09:30`、RFC 3339 和 Unix 时间戳。
+鼠标也能用：单击选中，双击恢复；单击状态行的筛选弹出下拉菜单；滚轮滚动鼠标所在的列表或预览；底部的按键提示可以直接点。
 
-通用选项：
+全文阅读里，Markdown 正常排版，工具调用默认折叠；j/k 滚动，`/` 查找，t 展开工具输出，Enter 恢复。从搜索结果打开时直接跳到命中的那条。
 
-- `--format text|jsonl|json`：终端里默认 `text`，管道里默认 `jsonl`。`json` 是一个完整文档，附带每台机器的耗时、传输字节数和错误。
-- `--timing`：在 stderr 打印每台机器的耗时、远端处理时间、传输量、走的通道。
-- `--no-broker`：不经过 broker，直接起 SSH（会用 OpenSSH 连接复用）。
-- `--timeout 3s`：每台机器的截止时间，默认 5 秒。到时没回的机器给出警告，其余结果照常返回。
+![全文阅读](docs/images/reader.png)
 
-## 工作方式
+### 快捷键
 
+在 shell 里按 Alt-M 打开，选中后恢复命令交给 shell 执行，会进入历史记录：
+
+```sh
+sessift shell fish | source     # fish：放进 fish_user_key_bindings 函数
+eval "$(sessift shell zsh)"      # zsh：放进 ~/.zshrc
+eval "$(sessift shell bash)"     # bash：只放到命令行，不自动执行
 ```
-sessift ──(进程内)──────────────> 本机后端
-   │
-   └─(Unix socket)─> broker ──(常驻 SSH 通道，帧协议 + zstd)──> 远端 sessift serve --stdio ──> 远端后端
+
+换键用 `--key`，如 `sessift shell fish --key ctrl-o`。Alt 组合键需要终端把 Option 当 Alt 发送：Ghostty 设 `macos-option-as-alt = true`，iTerm2 把 Option 键设为 Esc+。
+
+## 多台机器
+
+远端机器要能用 `ssh <别名>` 免密登录。和本机是同一平台时（比如都是 Apple Silicon 的 Mac），一条命令就能把本机的 sessift 装过去：
+
+```sh
+sessift remote install devbox    # 装到 devbox 的 ~/.sessift/bin/sessift
 ```
 
-- **broker**：第一次查询远端时自动在后台启动，对每台机器保持一条 SSH 通道，启动时预先连接默认机器，空闲 30 分钟退出。日志在 `~/.sessift/log/broker.log`。
-- **断线和休眠**：请求途中连接断了，自动换新连接重发一次。连接空闲 20 秒以上时，下一个请求会同时发一个探测，1～2 秒内没回就判定连接已死（比如笔记本休眠唤醒后），立即重连重发。请求超时但连接可能只是慢时，在后台再确认一次，确实不通才换连接。
-- **升级不打断查询**：换了新版本的 sessift 后，旧 broker 会在没有查询进行时自行退出，下次调用启动新版本。
-- **只传结果**：远端查完再按字符预算截断，搜索只回前 K 条摘要，会话列表只回会话摘要，正文按页取。超过 1KB 的响应用 zstd 压缩。
-- **可取消**：超时或放弃的请求会通知远端停止，并结束对应的后端进程。
-- **容错**：远端登录 shell 打印的问候语会被跳过；远端没装 sessift、协议版本不一致、SSH 失败都会给出明确提示。
+平台不同时，在远端从源码安装，再用下面的 `remote_command` 指向它。
 
-协议见 [docs/remote-protocol.md](docs/remote-protocol.md)。
-
-## 配置
-
-`~/.sessift/config.toml`（`SESSIFT_HOME` 可改目录）：
+然后在 `~/.sessift/config.toml` 里加上这台机器：
 
 ```toml
 [defaults]
-machines = ["local", "mm"]   # 不带 -m 时查哪些机器
-timeout = "5s"
-
-[backend]
-kind = "native"              # 自研索引（默认）
-# refresh_every = "2s"               # 查询前最多多久检查一次新记录；"0" 不自动更新
-# max_concurrency = 4                # 远端同时执行的请求数
-
-[broker]
-# enabled = true
-# idle_timeout = "30m"
-# probe_after_idle = "20s"
+machines = ["local", "devbox"]   # 默认查哪些机器
+timeout = "5s"                   # 每台机器的截止时间
 
 [[machine]]
-id = "mm"
-label = "Mac mini"
-ssh = "mm"                   # ~/.ssh/config 里的 Host 别名
+id = "devbox"
+ssh = "devbox"                   # ~/.ssh/config 里的 Host
+# remote_command = "~/.sessift/bin/sessift"   # 远端 sessift 的位置
+```
+
+- 各台机器同时查，先到先显示，慢机器不拖累其他机器；超时的机器给出提示，其余结果照常返回。
+- 后台的 broker 为每台机器保持一条 SSH 连接，查询不用每次重新握手。笔记本休眠唤醒或断网后自动重连，请求半路断了会自动重发。
+- 只传结果：搜索只回前几十条摘要，正文按页取，较大的响应用 zstd 压缩。慢链路上也很快。
+- `sessift doctor` 检查每台机器的连接、版本和延迟。broker 的日志在 `~/.sessift/log/broker.log`，`sessift broker stop` 可以停掉它。
+
+<details>
+<summary>全部配置项</summary>
+
+配置文件在 `~/.sessift/config.toml`，用环境变量 `SESSIFT_HOME` 可以换目录。
+
+```toml
+[defaults]
+machines = ["local", "devbox"]   # 不带 -m 时查哪些机器
+timeout = "5s"                   # 每台机器的截止时间
+
+[backend]
+kind = "native"
+# refresh_every = "2s"           # 查询前最多多久检查一次新记录；"0" 表示不自动更新
+# max_concurrency = 4            # 本机作为远端时，同时执行的请求数
+
+[broker]
+# enabled = true                 # false 表示每次直接起 SSH
+# idle_timeout = "30m"           # 空闲多久后退出
+# probe_after_idle = "20s"       # 连接空闲多久后，下次请求先探测连接是否还活着
+
+[[machine]]
+id = "devbox"
+label = "开发机"                 # 可选，显示用
+ssh = "devbox"                   # ~/.ssh/config 里的 Host
 # remote_command = "~/.sessift/bin/sessift"
 # ssh_options = ["-o", "Compression=no"]
 ```
 
+</details>
+
+## 命令行
+
+```
+$ sessift search 回滚 -n 3 --per-session
+  4.0  2026-10-31 10:38  local   codex   infra          user  019d5752-0455-5952-9849-9aa89d72a672
+       staging 的数据库迁移 0042 失败了，看看 runbook，现在还能不能回滚？
+  3.5  2026-10-28 11:26  devbox  pi      infra          user  4d7af282-25b2-52e5-828f-f4ddb36cc7cc
+       写一个发布脚本：先备份，再上传，失败自动回滚
+  3.1  2026-10-30 12:38  devbox  claude  data-pipeline  user  930af6c6-188c-5cc8-868d-8ee59e0eb76a
+       每日 ETL 失败后要能自动重跑，失败的那天要能回滚到上一个分区
+```
+
+| 命令 | 作用 |
+|---|---|
+| `sessift search <词…>` | 搜索。`-m` 选机器（`all` 表示全部），`-n` 条数，`--source`、`--project`、`--cwd`、`--since 7d` 等过滤，`--per-session` 每个会话一条 |
+| `sessift sessions` | 按最后活跃时间列会话 |
+| `sessift read <会话 ID>` | 分页读正文，自动在各台机器上找这个会话 |
+| `sessift` | 交互界面 |
+| `sessift shell fish\|zsh\|bash` | 输出快捷键绑定 |
+| `sessift doctor` | 诊断连接、版本、延迟 |
+| `sessift remote install <机器…>` | 安装或更新远端的 sessift |
+| `sessift index` | 手动建立或更新本机索引（平时查询前会自动更新） |
+
+终端里默认输出文本，管道里默认输出 JSON Lines，方便接 `jq` 或别的脚本；`--format json` 输出一个完整文档，附带每台机器的耗时和错误。每个命令的完整参数见 `sessift <命令> --help`。
+
+## 支持的来源
+
+| 来源 | 读取位置 |
+|---|---|
+| Claude Code | `~/.claude/projects` |
+| Codex | `~/.codex/sessions`，包括压缩过的旧会话（`.jsonl.zst`） |
+| Pi | `~/.pi/agent/sessions` |
+| OpenCode | `~/.local/share/opencode` 里的数据库 |
+| Grok | `~/.grok/sessions` |
+
+会话列表默认只列人参与的对话；子 agent、`codex exec` 这类脚本跑的会话按 `a` 或 `--kind all` 才显示，搜索时排在后面。
+
+## 性能
+
+MacBook 加一台 Mac mini，链路往返约 25ms。从命令启动到结束，20 次取中位数：
+
+| 场景 | 耗时 |
+|---|---|
+| 搜索，本机 + 远端 | 29ms |
+| 搜索，只查远端 | 45ms |
+| 搜索，只查本机 | 21ms |
+| 列 50 个会话，本机 + 远端 | 30ms |
+| 搜索，只查远端，不经 broker（每次新建 SSH 连接） | 168ms |
+
+本机索引（9.7GB 会话记录、47 万条）：
+
+| 场景 | 耗时 |
+|---|---|
+| 查询前检查新记录，没有变化 | 约 19ms |
+| 查询前增量更新，有新记录（正在进行的会话） | 25～35ms |
+| 从零建索引 | 8.8 秒，索引 462MB |
+
 ## 开发
 
 ```sh
-cargo test                   # 单元测试 + 集成测试（用本地子进程模拟远端，不需要 SSH）
-cargo clippy --all-targets
-cargo fmt --check
-scripts/bench.py --sessift target/release/sessift
-scripts/eval.py --sessift target/release/sessift   # 搜索质量评测，见下文
+cargo fmt --check && cargo clippy --all-targets && cargo test
 ```
 
-搜索质量用 `scripts/eval.py` 评测：一组"凭印象找某个会话"的查询（标注了目标会话）和一组主题查询，输出 MRR@10、前 10 命中数、前 10 里自动线程的个数和延迟。查询来自真实会话，放在 `~/.sessift/eval/`，不进仓库；格式见脚本开头。排序参数可以用 `SESSIFT_RANK` 临时覆盖（如 `--env SESSIFT_RANK=cross=0,title=0`），用来在同一份索引上比较。
-
-自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致，覆盖 Claude、Codex、Pi、OpenCode、Grok），见 `tests/native.rs` 和 `tests/cli.rs` 的 `native_backend_end_to_end`。
-
-测试共 134 个：协议层（取消释放并发名额、版本不符、大响应压缩、远端崩溃）、多机合并与分页、broker（共享、退役替换、僵死连接、途中断线重试）、自研索引（各来源解析、增量更新、段合并）、交互界面（状态与按键、渲染、Markdown 排版与折行）、shell 绑定语法等。
-
-集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。
+设计和路线图见 [docs/plan.md](docs/plan.md)，远程协议见 [docs/remote-protocol.md](docs/remote-protocol.md)，各来源的格式见 [docs/formats.md](docs/formats.md)。

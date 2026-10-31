@@ -15,7 +15,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `README.md` | 用法、按键、命令、配置、性能数据 |
+| `README.md` | 面向新用户的简要说明：功能、安装、按键、多机配置、命令、性能、截图（`docs/images/`）。不写开发细节，不提 memex |
 | `docs/plan.md` | 背景、设计原则、路线图、各阶段方案与结果，阶段 2 的详细方案 |
 | `docs/remote-protocol.md` | 远程协议：帧格式、握手、操作、错误码、broker 消息、连接可靠性 |
 | `docs/formats.md` | Claude、Codex、Pi、OpenCode、Grok 会话记录的格式要点和解析规则 |
@@ -45,6 +45,7 @@
 | `tests/` | `cli.rs` 端到端（本地命令代替 SSH），`native.rs` 自研索引，`protocol.rs` 协议层；`fixtures/home/` 是虚构的各来源会话 |
 | `scripts/bench.py` | 命令行延迟基准；装了 memex 时同时测它作对照 |
 | `scripts/eval.py` | 搜索质量评测，数据在 `~/.sessift/eval/`（真实内容，不进仓库） |
+| `scripts/screenshots/` | README 截图：`demo.py` 造虚构会话，`shoot.py` 在 tmux 里操作界面并截屏，`render.py` 渲染成 PNG，`run.sh` 串起来 |
 
 ## 常用命令
 
@@ -57,6 +58,10 @@ sessift doctor                                                  # 连接、版�
 scripts/bench.py --sessift target/release/sessift               # 延迟基准
 scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索质量，改排序或解析后跑
 ```
+
+- 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致）。
+- 搜索质量评测 `scripts/eval.py`：一组"凭印象找某个会话"的查询（标注了目标会话）和一组主题查询，输出 MRR@10、前 10 命中数、前 10 里自动线程的个数和延迟。查询格式见脚本开头。排序参数可以用 `SESSIFT_RANK` 临时覆盖（如 `--env SESSIFT_RANK=cross=0,title=0`），在同一份索引上比较。
+- README 的截图用 `scripts/screenshots/run.sh` 重新生成：虚构的会话分在两台假机器上，在独立的 tmux 里跑真实的界面并截屏，再用无界面 Chrome 渲染（需要 tmux、Chrome、ImageMagick、Pillow 和 Maple Mono NF CN 字体）。改了界面后重新生成。
 
 测试里所有数据都在临时目录（`SESSIFT_HOME`），不会碰真实的 `~/.sessift`；测试结束会停掉自己起的 broker。
 
