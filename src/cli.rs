@@ -79,6 +79,10 @@ pub struct PickArgs {
     /// Called from a shell binding: print `run`/`edit` and the command, quoted for this shell
     #[arg(long, value_enum)]
     pub shell: Option<ShellKind>,
+    /// Called from the Herdr plugin: resume in Herdr (the open pane, the shell under the popup,
+    /// or a new tab); `e` fills that shell's prompt. Quotes for `--shell`, else `$SHELL`
+    #[arg(long)]
+    pub herdr: bool,
     /// Start with this query
     #[arg(long, allow_hyphen_values = true)]
     pub query: Option<String>,
@@ -826,35 +830,65 @@ async fn doctor(ctx: &Ctx, args: DoctorArgs) -> Result<i32> {
 
 async fn pick_cmd(ctx: &Ctx, args: PickArgs) -> Result<i32> {
     let machines = ctx.config().select(&args.sel.machines)?;
+    let shell = match args.shell {
+        None if args.herdr => Some(ShellKind::from_env()),
+        shell => shell,
+    };
     let options = crate::tui::TuiOptions {
         machines,
         timeout: ctx.timeout(&args.sel),
         query: args.query.unwrap_or_default(),
-        shell: args.shell,
+        shell,
     };
     let exit = crate::tui::run(ctx.runner.clone(), options).await?;
     use crate::tui::app::Exit;
+    if args.herdr {
+        let (run, chosen) = match exit {
+            Exit::Quit => return Ok(0),
+            Exit::Run(chosen) => (true, chosen),
+            Exit::Edit(chosen) => (false, chosen),
+        };
+        // A handful of short herdr CLI calls.
+        return tokio::task::spawn_blocking(move || {
+            let herdr = crate::herdr::Herdr::from_env();
+            let result = if run {
+                herdr.resume(&chosen)
+            } else {
+                herdr.edit(&chosen)
+            };
+            match result {
+                Ok(_) => 0,
+                Err(err) => {
+                    herdr.fail(&chosen, &err);
+                    eprintln!("{} {err:#}", Style::stderr().red("error:"));
+                    1
+                }
+            }
+        })
+        .await
+        .context("herdr hand-off");
+    }
     match (exit, args.shell) {
         (Exit::Quit, _) => Ok(0),
         // A shell binding runs or edits the command itself, so it lands in history.
-        (Exit::Run(command), Some(_)) => {
-            emit(&format!("run\n{command}\n"));
+        (Exit::Run(chosen), Some(_)) => {
+            emit(&format!("run\n{}\n", chosen.command));
             Ok(0)
         }
-        (Exit::Edit(command), Some(_)) => {
-            emit(&format!("edit\n{command}\n"));
+        (Exit::Edit(chosen), Some(_)) => {
+            emit(&format!("edit\n{}\n", chosen.command));
             Ok(0)
         }
-        (Exit::Run(command), None) => {
+        (Exit::Run(chosen), None) => {
             use std::os::unix::process::CommandExt;
-            eprintln!("{command}");
+            eprintln!("{}", chosen.command);
             let err = std::process::Command::new("/bin/sh")
-                .args(["-c", &command])
+                .args(["-c", &chosen.command])
                 .exec();
             Err(err).context("run the resume command")
         }
-        (Exit::Edit(command), None) => {
-            emit(&format!("{command}\n"));
+        (Exit::Edit(chosen), None) => {
+            emit(&format!("{}\n", chosen.command));
             Ok(0)
         }
     }

@@ -51,7 +51,7 @@ sessift 是一个命令行工具：搜索、浏览本机和其他机器上的 AI
 | 2 | 自研索引：Claude / Codex / Pi / OpenCode 解析，增量入库，SQLite 会话表，Tantivy + 中英文混合分词（中文 bigram），正文按文件偏移按需读取，不复制原文 | 完成（2026-10-30）；2026-10-31 两台机器切换，memex 适配器已删除，memex 已卸载 |
 | 3 | 搜索质量：评测集、排序调优、会话种类过滤、Grok 来源、边打字边搜；向量检索视评测结果再定 | 第 1～5、7 步完成（2026-10-31），向量检索待定，见下文"阶段 3" |
 | 4 | 稳定化：文件监听增量索引、打包（Homebrew）、文档、长时间运行测试 | 未开始 |
-| 5 | agent 支持（MCP / skill）、herdr 支持、app | 未开始 |
+| 5 | agent 支持（MCP / skill）、herdr 支持、app | herdr 插件完成（2026-10-31）；agent skill 方案见下文"阶段 5" |
 
 ## 阶段 1：远程查询层
 
@@ -461,3 +461,31 @@ memex 适配器（`src/backend/memex.rs` 和它的测试）已删除；配置里
 - 评测加入 mm 上的会话（需要远端也能切换排序参数，或者只测默认参数）。
 - 更多注入文字：Claude 桌面版 `mcp__ccd_turn__wrap_up` 工具调用重复了最后的回答；本地斜杠命令的回显（`/model`、"Set model to …"）当成了用户消息；Codex 里导入的 Claude 对话（`[external_agent_tool_call: …]`）整段算助手消息。
 - 会话记录里的明文密钥会被索引、能搜到（两个 agent 各发现一处）。sessift 只读不改原文件，要不要在索引时屏蔽常见的密钥格式，留给用户决定。
+
+## 阶段 5：herdr 插件与 agent skill（2026-10-31）
+
+### Alt-M 在 herdr 里没反应
+
+不是代码问题：fish 的绑定在 `fish_user_key_bindings` 里，只对之后启动的 shell 生效，而 herdr 的 pane 会活好几天，加绑定之前开的 shell 没有它，`exec fish` 一次就好。另外 agent pane 里按 Alt-M，按键被 agent 收走，到不了 shell。所以 shell 命令行继续用 Alt-M，herdr 里另给一个在任何 pane 都能用的入口。
+
+### herdr 插件（`herdr/`）
+
+- 安装 `herdr plugin install kadaliao/sessift/herdr`，绑 `prefix+m` 到 `sessift.open`（memex 插件原来用这个键）。
+- `open` action 打开 popup 类型的插件 pane，里面跑 `picker.sh`：找 sessift（PATH、`~/.local/bin`、Homebrew、`~/.sessift/bin`），执行 `sessift pick --herdr`；找不到、版本太旧或出错时停住等回车，免得浮层一闪而过。
+- `sessift pick --herdr`（`src/herdr.rs`）选中后不输出命令，自己调 herdr 的命令行：
+  - Enter：本机会话先在 `pane list` 里找 `agent_session` 等于这个会话 ID 的 pane，有就 `agent focus` 过去，免得同一个会话恢复两份；否则看浮层下面的 pane（`HERDR_PLUGIN_CONTEXT_JSON` 的 `focused_pane_id`，popup 自己没有 `HERDR_PANE_ID`），它的前台进程就是 pane 自己的 shell 时在这里 `pane run`，命令进 shell 历史；都不是就在当前 workspace `tab create`（本机会话设好 cwd，标题用会话标题，远端加机器名前缀）再 `pane run`。
+  - e：浮层下面是空闲 shell 就 `pane send-text` 放到命令行；否则复制并弹 herdr 通知。
+  - herdr 调用失败时复制恢复命令、用通知显示错误：浮层关掉后 stderr 就看不到了。
+  - 命令按 `$SHELL` 转义（新 tab 和浮层下面的 pane 跑的都是登录 shell）。
+- "空闲 shell"的判断：前台进程组等于 pane 的 shell 进程，并且进程名是已知的 shell。只看前者不够：直接以命令启动的 pane（插件 pane、`type = "pane"` 的命令）里，那个命令本身就是"shell"。
+- 测试：`src/herdr.rs` 用假的 herdr 脚本（记录参数、返回预设 JSON）覆盖各分支；在真实 herdr 里用 fixture 后端的假会话（恢复命令是 `echo`）在两个后台 tab 里跑过四条路径。
+
+### agent skill（方案，未实施）
+
+值得做，工作量小。agent 不知道 sessift 存在、什么时候该用；用户说"上次在 mm 上怎么修的""继续昨天那个任务"时，agent 应该能跨机器、跨 agent 去查。不用 MCP：命令行已有 jsonl 输出，不用常驻进程，各家 agent 都能调。
+
+- `skills/sessift/SKILL.md`，`sessift skill install` 用 `include_str!` 编进二进制（skill 和二进制版本一致），写到本机装了的 agent 的 skill 目录（`~/.claude/skills/`、`~/.codex/skills/`），`--print` 只输出。
+- 内容：什么时候用；`sessift search … --format jsonl` 找，`sessift read <id> -m <机器>` 分页读、只读需要的部分；回答写明机器、时间、标题和恢复命令；不大段贴原文，密钥打码，只读不改。
+- 实施前要解决：
+  1. 当前会话会搜到自己（"评测会被自己污染"那条）。看各 agent 能不能拿到当前会话 ID（herdr 下有 `herdr pane get $HERDR_PANE_ID` 的 `agent_session`），能拿到就给 search 加 `--exclude-session`，否则 skill 里写明按 cwd 和最近活跃时间排除。
+  2. `read` 每页的字符预算和单条截断是否适合放进 agent 的上下文，必要时加 `--max-chars`。

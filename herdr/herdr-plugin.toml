@@ -1,0 +1,25 @@
+id = "sessift"
+name = "sessift"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Search and resume AI coding sessions (Claude Code, Codex, Pi, OpenCode, Grok) on this machine and others."
+platforms = ["macos", "linux"]
+
+# Bind it in ~/.config/herdr/config.toml:
+#   [[keys.command]]
+#   key = "prefix+m"
+#   type = "plugin_action"
+#   command = "sessift.open"
+[[actions]]
+id = "open"
+title = "Search sessions"
+description = "Open the session picker in a popup. Enter resumes the session, e puts the command on the prompt."
+command = ["sh", "open.sh"]
+
+[[panes]]
+id = "picker"
+title = "sessift"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["sh", "picker.sh"]

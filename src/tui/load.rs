@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::fanout::{Outcome, Runner};
 use crate::model::{ContextRequest, Page, ReadRequest, RecordView};
-use crate::pick::{self, ShellKind, Target};
+use crate::pick::{self, Chosen, ShellKind, Target};
 use crate::proto::{ErrorCode, Op, Reply};
 
 /// Identifies a session on a machine.
@@ -58,7 +58,7 @@ pub enum Msg {
     },
     Command {
         purpose: Purpose,
-        command: String,
+        chosen: Chosen,
     },
 }
 
@@ -207,8 +207,8 @@ impl Loader {
                 session_id: key.session_id,
                 source_path: key.source_path,
             };
-            let command = pick::resume_command(&loader.runner, &target, loader.shell).await;
-            let _ = loader.tx.send(Msg::Command { purpose, command });
+            let chosen = pick::resume_command(&loader.runner, &target, loader.shell).await;
+            let _ = loader.tx.send(Msg::Command { purpose, chosen });
         })
     }
 }

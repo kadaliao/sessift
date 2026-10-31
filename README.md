@@ -102,6 +102,28 @@ eval "$(sessift shell bash)"     # bash：只放到命令行，不自动执行
 
 换键用 `--key`，如 `sessift shell fish --key ctrl-o`。Alt 组合键需要终端把 Option 当 Alt 发送：Ghostty 设 `macos-option-as-alt = true`，iTerm2 把 Option 键设为 Esc+。
 
+快捷键只对加了绑定之后启动的 shell 生效，已经开着的终端执行一次 `exec fish`（或 `exec zsh`）。
+
+### herdr
+
+在 [herdr](https://herdr.dev) 里，装上插件之后可以在任何 pane 里用浮层打开，包括正在跑 agent 的 pane（agent 自己会收走 Alt-M）：
+
+```sh
+herdr plugin install kadaliao/sessift/herdr
+```
+
+再在 `~/.config/herdr/config.toml` 里绑一个键：
+
+```toml
+[[keys.command]]
+key = "prefix+m"
+type = "plugin_action"
+command = "sessift.open"
+description = "搜索并恢复 agent 会话"
+```
+
+浮层里按 Enter 恢复会话：会话已经在某个 pane 里开着，就直接跳过去；浮层下面是空闲的 shell，就在这个 pane 里恢复；否则在当前 workspace 新开一个 tab。按 e 把恢复命令放到浮层下面那个 shell 的命令行上；下面是 agent 时改为复制到剪贴板。
+
 ## 多台机器
 
 远端机器要能用 `ssh <别名>` 免密登录。和本机是同一平台时（比如都是 Apple Silicon 的 Mac），一条命令就能把本机的 sessift 装过去：

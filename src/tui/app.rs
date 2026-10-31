@@ -13,6 +13,7 @@ use ratatui::text::Line;
 use super::load::{Key, Msg, Preview, PreviewKey, Purpose};
 use crate::fanout::{Outcome, merge_hits, merge_sessions};
 use crate::model::{Filters, RecordView, SearchRequest, SessionsRequest};
+use crate::pick::Chosen;
 use crate::proto::{Op, Reply};
 use crate::timefmt::now_ms;
 
@@ -186,8 +187,8 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
     Quit,
-    Run(String),
-    Edit(String),
+    Run(Chosen),
+    Edit(Chosen),
 }
 
 /// Full-screen reading of one session.
@@ -613,13 +614,13 @@ impl App {
                     Err(message) => reader.error = Some(message),
                 }
             }
-            Msg::Command { purpose, command } => {
+            Msg::Command { purpose, chosen } => {
                 self.pending = None;
                 match purpose {
-                    Purpose::Run => self.exit = Some(Exit::Run(command)),
-                    Purpose::Edit => self.exit = Some(Exit::Edit(command)),
+                    Purpose::Run => self.exit = Some(Exit::Run(chosen)),
+                    Purpose::Edit => self.exit = Some(Exit::Edit(chosen)),
                     Purpose::Copy => {
-                        self.effects.push(Effect::Copy(command));
+                        self.effects.push(Effect::Copy(chosen.command));
                         self.set_status("已复制恢复命令");
                     }
                 }
@@ -1432,11 +1433,15 @@ mod tests {
                 ..
             }
         ));
+        let chosen = Chosen {
+            command: "claude --resume a".into(),
+            ..Chosen::default()
+        };
         app.on_msg(Msg::Command {
             purpose: Purpose::Run,
-            command: "claude --resume a".into(),
+            chosen: chosen.clone(),
         });
-        assert_eq!(app.exit, Some(Exit::Run("claude --resume a".into())));
+        assert_eq!(app.exit, Some(Exit::Run(chosen)));
     }
 
     #[test]

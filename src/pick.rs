@@ -2,7 +2,8 @@
 //! key bindings that open the picker.
 //!
 //! The picker talks to the shell binding through stdout: nothing (cancelled), or two lines,
-//! an action (`run` executes, `edit` only fills the prompt) and the command.
+//! an action (`run` executes, `edit` only fills the prompt) and the command. Inside Herdr the
+//! picker hands the choice to `crate::herdr` instead.
 
 use std::io::Write;
 use std::process::Stdio;
@@ -22,6 +23,24 @@ pub enum ShellKind {
     Bash,
     /// POSIX sh quoting.
     Sh,
+}
+
+impl ShellKind {
+    /// The shell a path like `$SHELL` or `-fish` names; anything unknown quotes as POSIX sh.
+    pub fn from_path(path: &str) -> Self {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        match name.trim_start_matches('-') {
+            "fish" => Self::Fish,
+            "zsh" => Self::Zsh,
+            "bash" => Self::Bash,
+            _ => Self::Sh,
+        }
+    }
+
+    /// The user's login shell, from `$SHELL`.
+    pub fn from_env() -> Self {
+        Self::from_path(&std::env::var("SHELL").unwrap_or_default())
+    }
 }
 
 /// Quote one word for `shell`.
@@ -50,8 +69,19 @@ pub struct Target {
     pub source_path: String,
 }
 
+/// What the picker hands back: the resume command and where the session lives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chosen {
+    pub command: String,
+    pub machine: String,
+    pub session_id: String,
+    /// The session's directory on its own machine.
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+}
+
 /// Look the session up on its machine and build the command that resumes it from here.
-pub async fn resume_command(runner: &Runner, target: &Target, shell: ShellKind) -> String {
+pub async fn resume_command(runner: &Runner, target: &Target, shell: ShellKind) -> Chosen {
     let request = SessionsRequest {
         limit: 20,
         filters: Filters {
@@ -76,7 +106,13 @@ pub async fn resume_command(runner: &Runner, target: &Target, shell: ShellKind) 
         .then(|| runner.config().spec(&target.machine).ok())
         .flatten()
         .map(|spec| spec.transport);
-    build_resume(target, summary, transport.as_ref(), shell)
+    Chosen {
+        command: build_resume(target, summary, transport.as_ref(), shell),
+        machine: target.machine.clone(),
+        session_id: target.session_id.clone(),
+        cwd: summary.and_then(|s| s.cwd.clone()),
+        title: summary.and_then(|s| s.title.clone()),
+    }
 }
 
 /// Pure part of [`resume_command`].
@@ -267,6 +303,18 @@ bind -x '"{seq}": __sessift_widget'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_from_path() {
+        assert_eq!(
+            ShellKind::from_path("/opt/homebrew/bin/fish"),
+            ShellKind::Fish
+        );
+        assert_eq!(ShellKind::from_path("-zsh"), ShellKind::Zsh);
+        assert_eq!(ShellKind::from_path("bash"), ShellKind::Bash);
+        assert_eq!(ShellKind::from_path("/bin/dash"), ShellKind::Sh);
+        assert_eq!(ShellKind::from_path(""), ShellKind::Sh);
+    }
 
     #[test]
     fn quoting_per_shell() {

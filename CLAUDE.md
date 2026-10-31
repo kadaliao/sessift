@@ -9,6 +9,7 @@
 - 阶段 3（搜索质量）完成了第 1～5 步和收尾，已合并到 main 并推送，两台机器已装上。结果见 `docs/plan.md` 的"阶段 3 结果"：评测 MRR@10 0.815 → 0.898，会话列表默认只列对话，新增 Grok 来源，边打字边搜。
 - 2026-10-31 交互界面加了搜索框里的 Alt-s/t/m/a 筛选和鼠标支持，并发布第一个版本 v0.1.0（GitHub Release，附 macOS arm64 二进制）。
 - 2026-10-31 可以用 Homebrew 安装：`brew install kadaliao/tap/sessift`，个人 tap 仓库 https://github.com/kadaliao/homebrew-tap （`Formula/sessift.rb`，直接装 Release 里的 arm64 二进制）。项目还没有许可证、也没有知名度，进不了 homebrew-core。
+- 2026-10-31 新增 herdr 插件（`herdr/`，`prefix+m` 打开浮层，`sessift pick --herdr` 选中后在 herdr 里恢复），本机已 link 并绑好键。还没发版：用 brew 装的 v0.1.0 没有 `--herdr`。agent skill 的方案在 `docs/plan.md` 的"阶段 5"，未实施。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
@@ -40,6 +41,8 @@
 | `src/index/` | 自研索引：`source/` 各来源解析器，`ingest` 增量入库，`query` 查询，`rank` 会话排序规则与 `SESSIFT_RANK`，`store` SQLite，`fulltext` Tantivy、收集器与段合并策略，`directory` Tantivy 文件目录，`tokenizer` 中英文分词，`reader` 按位置读原文 |
 | `src/tui/` | 交互界面：`app` 状态与按键，`load` 后台请求，`view` 绘制，`md` 排版，`theme` 配色 |
 | `src/pick.rs` | 恢复命令、按 shell 转义、剪贴板、shell 快捷键脚本 |
+| `src/herdr.rs` | `pick --herdr`：选中后经 herdr 命令行恢复（跳到已开的 pane、浮层下的空闲 shell、或新 tab） |
+| `herdr/` | herdr 插件：manifest、`open.sh`（打开 popup）、`picker.sh`（找 sessift 并运行） |
 | `src/output.rs` | CLI 的 text、jsonl、json 输出 |
 | `src/text.rs`、`src/timefmt.rs` | CJK 安全的截断与宽度、终端控制字符清理；时间解析与格式化 |
 | `src/install.rs` | `sessift remote install` |
@@ -96,4 +99,6 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - **改了解析器版本（`VERSION`）后，新旧两个二进制会互相把对方的结果重新解析一遍**（版本不同就整个来源重解析）。开发时用临时 `SESSIFT_HOME` 跑新版本，确定后再装到 `~/.local/bin`。
 - **评测会被自己污染**：在 Claude 里读会话、写查询的那个会话和它的子 agent 会话，正文里就有目标会话的内容和查询词，会排到最前。把这些会话的 ID 加进 `~/.sessift/eval/exclude.txt`。
 - **发版的二进制会带上本机路径**：Rust 标准库和依赖的源码路径会编进二进制（几百处家目录路径）。发版时用 `RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=sessift"`，加单独的 `CARGO_TARGET_DIR` 编译（免得冲掉平时的编译缓存），打包前用 `strings` 确认没有家目录路径。
+- **shell 快捷键只对之后启动的 shell 生效**：herdr 的 pane 会活好几天，改了 `fish_user_key_bindings` 后旧 pane 要 `exec fish`。agent pane 里的 Alt-M 被 agent 收走，所以 herdr 里另用插件。
+- **herdr 插件的 popup 没有 pane ID**：拿不到 `HERDR_PANE_ID`，浮层下面的 pane 从 `HERDR_PLUGIN_CONTEXT_JSON` 的 `focused_pane_id` 取。popup 不能用 `pane send-keys` 操作，测试时直接在普通 pane 里跑 `sessift pick --herdr` 并手动设这个环境变量；popup 用 socket 的 `popup.close` 关。herdr 命令出错时把 JSON 错误写在 stdout、退出码 1。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。
