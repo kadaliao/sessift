@@ -195,6 +195,7 @@ fn session_matches(session: &SessionSummary, filters: &Filters) -> bool {
     eq(&filters.source, &session.source)
         && eq(&filters.project, &session.project)
         && eq(&filters.session_id, &session.session_id)
+        && !filters.exclude_sessions.contains(&session.session_id)
         && filters.cwd.as_ref().is_none_or(|cwd| {
             session
                 .cwd

@@ -19,6 +19,8 @@ pub const MAX_CHARS_MAX: u32 = 200_000;
 pub const CONTEXT_BEFORE_DEFAULT: u32 = 3;
 pub const CONTEXT_AFTER_DEFAULT: u32 = 8;
 pub const CONTEXT_SIDE_MAX: u32 = 100;
+/// What the command line keeps of each tool call and output when reading (`--tool-chars`).
+pub const TOOL_CHARS_DEFAULT: u32 = 1500;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Filters {
@@ -41,6 +43,10 @@ pub struct Filters {
     /// message) and `all`. Unset: session lists show `conversation`, searches `all`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Leave these sessions out, together with the sessions spawned or forked from them. The
+    /// CLI puts the calling agent's own session here, which otherwise matches every query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_sessions: Vec<String>,
 }
 
 /// Kinds in the `conversation` group; sessions without a kind count as `main`.
@@ -130,6 +136,10 @@ pub struct ReadRequest {
     pub limit: u32,
     #[serde(default = "default_max_chars")]
     pub max_chars: u32,
+    /// Characters kept of each tool call and tool output before the page budget is shared out,
+    /// so that long outputs do not crowd out the conversation. Unset keeps them whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_chars: Option<u32>,
 }
 
 /// Records around one record, for showing a search hit in place.
@@ -145,6 +155,9 @@ pub struct ContextRequest {
     pub after: u32,
     #[serde(default = "default_max_chars")]
     pub max_chars: u32,
+    /// As in [`ReadRequest::tool_chars`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_chars: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +302,7 @@ impl ReadRequest {
             offset: 0,
             limit: READ_LIMIT_DEFAULT,
             max_chars: MAX_CHARS_DEFAULT,
+            tool_chars: None,
         }
     }
 
@@ -297,7 +311,8 @@ impl ReadRequest {
             return Err("session_id must not be empty".into());
         }
         check_range("limit", self.limit, 1, READ_LIMIT_MAX)?;
-        check_range("max_chars", self.max_chars, MAX_CHARS_MIN, MAX_CHARS_MAX)
+        check_range("max_chars", self.max_chars, MAX_CHARS_MIN, MAX_CHARS_MAX)?;
+        check_tool_chars(self.tool_chars)
     }
 }
 
@@ -309,6 +324,7 @@ impl ContextRequest {
             before: CONTEXT_BEFORE_DEFAULT,
             after: CONTEXT_AFTER_DEFAULT,
             max_chars: MAX_CHARS_DEFAULT,
+            tool_chars: None,
         }
     }
 
@@ -318,7 +334,15 @@ impl ContextRequest {
         }
         check_range("before", self.before, 0, CONTEXT_SIDE_MAX)?;
         check_range("after", self.after, 0, CONTEXT_SIDE_MAX)?;
-        check_range("max_chars", self.max_chars, MAX_CHARS_MIN, MAX_CHARS_MAX)
+        check_range("max_chars", self.max_chars, MAX_CHARS_MIN, MAX_CHARS_MAX)?;
+        check_tool_chars(self.tool_chars)
+    }
+}
+
+fn check_tool_chars(value: Option<u32>) -> Result<(), String> {
+    match value {
+        Some(v) => check_range("tool_chars", v, 1, MAX_CHARS_MAX),
+        None => Ok(()),
     }
 }
 

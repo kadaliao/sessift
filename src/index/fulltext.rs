@@ -334,6 +334,16 @@ impl FullText {
                     .map(|id| Term::from_field_u64(f.sess, *id as u64)),
             ))));
         }
+        if !spec.exclude.is_empty() {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermSetQuery::new(
+                    spec.exclude
+                        .iter()
+                        .map(|id| Term::from_field_u64(f.sess, *id as u64)),
+                )),
+            ));
+        }
         if let Some(role) = spec.role {
             clauses.push(filter(Box::new(TermQuery::new(
                 Term::from_field_u64(f.role, role as u64),
@@ -420,6 +430,8 @@ pub struct SearchSpec<'a> {
     pub query: &'a str,
     /// Restrict to these sessions (session-level filters resolved in SQLite).
     pub sessions: Option<&'a [i64]>,
+    /// Leave these sessions out.
+    pub exclude: &'a [i64],
     pub role: Option<u8>,
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
@@ -709,6 +721,7 @@ mod tests {
         SearchSpec {
             query,
             sessions: None,
+            exclude: &[],
             role: None,
             since_ms: None,
             until_ms: None,

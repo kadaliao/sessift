@@ -7,7 +7,8 @@
 - **快**：本机加一台远端机器一起搜，从敲下命令到出结果 29 毫秒，和一次网络往返（约 25 毫秒）差不多。
 - **数据不用同步**：会话留在各自的机器上，查询时到每台机器现场查，只把结果传回来。能 `ssh` 上去就行。
 - **中英文全文搜索**：边打字边搜，按会话排序，每个会话只显示最相关的一条。
-- **找到就能接着干**：Enter 直接恢复会话，远端的会话自动 `ssh -t` 过去。
+- **找到就能接着干**：Enter 直接恢复会话，远端的会话自动 `ssh -t` 过去。shell 里按 Alt-M，herdr 里按 prefix+m。
+- **agent 也能用**：自带 agent skill，你提到"上次那个会话"时，Claude Code、Codex 等会自己去查。
 - **索引小而快**：47 万条记录（9.7GB 会话记录）8.8 秒建完索引，索引只有 462MB；之后查询前自动增量更新，没有新记录时只花约 19 毫秒。
 - **只读**：不改动任何会话文件，索引放在 `~/.sessift`。
 
@@ -198,14 +199,29 @@ $ sessift search 回滚 -n 3 --per-session
 |---|---|
 | `sessift search <词…>` | 搜索。`-m` 选机器（`all` 表示全部），`-n` 条数，`--source`、`--project`、`--cwd`、`--since 7d` 等过滤，`--per-session` 每个会话一条 |
 | `sessift sessions` | 按最后活跃时间列会话 |
-| `sessift read <会话 ID>` | 分页读正文，自动在各台机器上找这个会话 |
+| `sessift read <会话 ID>` | 分页读正文，自动在各台机器上找这个会话；`--around <record_id>` 从搜索命中的那条开始读，`--tail 30` 读最后 30 条 |
 | `sessift` | 交互界面 |
 | `sessift shell fish\|zsh\|bash` | 输出快捷键绑定 |
+| `sessift skill [install]` | 输出或安装给 agent 用的 skill |
 | `sessift doctor` | 诊断连接、版本、延迟 |
 | `sessift remote install <机器…>` | 安装或更新远端的 sessift |
 | `sessift index` | 手动建立或更新本机索引（平时查询前会自动更新） |
 
 终端里默认输出文本，管道里默认输出 JSON Lines，方便接 `jq` 或别的脚本；`--format json` 输出一个完整文档，附带每台机器的耗时和错误。每个命令的完整参数见 `sessift <命令> --help`。
+
+## 给 agent 用
+
+sessift 自带一个 [agent skill](skills/sessift/SKILL.md)，教 Claude Code、Codex 等 agent 在你提到以前的会话时自己去查、去读：
+
+```sh
+sessift skill install
+```
+
+它写到 `~/.agents/skills/sessift/`（Codex、Pi、OpenCode、Grok 从这里读），并在 `~/.claude/skills/` 里放一个指向它的链接（Claude Code 只读这里）。升级 sessift 后再执行一次，`sessift doctor` 会提示版本对不上。`sessift skill` 只输出内容，`--dir` 装到别的目录。
+
+装好后可以直接问 agent "上次在另一台机器上是怎么配 nginx 反向代理的""接着做昨天那个迁移脚本"。agent 会用 `search` 找到会话，再用 `read --around` 从命中的地方读。
+
+agent 里运行的 sessift 会自动排除 agent 自己的会话和它的子 agent，免得搜到正在进行的这段对话（Claude Code、Codex、Pi 会通过环境变量告诉命令当前的会话 ID）。`--include-current` 可以关掉。
 
 ## 支持的来源
 

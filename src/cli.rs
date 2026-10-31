@@ -13,7 +13,7 @@ use crate::broker::{self, BrokerClient};
 use crate::client::{ConnectOptions, Connection};
 use crate::config::{self, Config, LOCAL, Paths};
 use crate::fanout::{Outcome, Runner, Via, merge_hits, merge_sessions};
-use crate::model::{self, Filters, ReadRequest, SearchRequest, SessionsRequest};
+use crate::model::{self, ContextRequest, Filters, ReadRequest, SearchRequest, SessionsRequest};
 use crate::output::{self, Format, Style, emit};
 use crate::pick::{self, ShellKind};
 use crate::proto::{Op, Reply};
@@ -67,6 +67,8 @@ pub enum Command {
     Pick(PickArgs),
     /// Print the key binding that opens `sessift pick` (fish, zsh or bash)
     Shell(ShellArgs),
+    /// Print the agent skill that teaches coding agents to search past sessions, or install it
+    Skill(SkillArgs),
     /// Serve the remote protocol on stdin/stdout (started over SSH)
     #[command(hide = true)]
     Serve(ServeArgs),
@@ -128,6 +130,32 @@ pub struct FilterArgs {
     /// groups conversation and all [default: conversation for `sessions`, all for `search`]
     #[arg(long, value_name = "KIND")]
     pub kind: Vec<String>,
+    /// Also return the calling agent's own session (and its subagents), otherwise left out.
+    /// Found through CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, PI_SESSION_ID or GROK_SESSION_ID
+    #[arg(long)]
+    pub include_current: bool,
+}
+
+/// Variables through which agents tell the commands they run which session they are in.
+const CURRENT_SESSION_VARS: &[&str] = &[
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "PI_SESSION_ID",
+    "GROK_SESSION_ID",
+];
+
+/// The sessions of the agents this command runs under; nested agents give several.
+fn current_sessions() -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for var in CURRENT_SESSION_VARS {
+        if let Ok(id) = std::env::var(var) {
+            let id = id.trim().to_string();
+            if !id.is_empty() && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 #[derive(Args, Debug)]
@@ -142,7 +170,7 @@ pub struct SearchArgs {
     /// Only records with this role (user, assistant, tool_use, tool_result)
     #[arg(long)]
     pub role: Option<String>,
-    /// Only this session
+    /// Only this session; its best matches are listed in time order
     #[arg(long, value_name = "SESSION_ID")]
     pub session: Option<String>,
     /// Maximum results after merging machines
@@ -188,12 +216,23 @@ pub struct ReadArgs {
     /// Records to skip
     #[arg(long, default_value_t = 0)]
     pub offset: u32,
+    /// Read around this record (a `record_id` from `search`) instead of from --offset: about a
+    /// quarter of --limit before it, the rest after. Continue with --offset <next_offset>
+    #[arg(long, value_name = "RECORD_ID", conflicts_with = "offset")]
+    pub around: Option<String>,
     /// Records per page
     #[arg(short = 'n', long, default_value_t = model::READ_LIMIT_DEFAULT)]
     pub limit: u32,
     /// Character budget shared by the page
     #[arg(long, default_value_t = model::MAX_CHARS_DEFAULT)]
     pub max_chars: u32,
+    /// Characters kept of each tool call and tool output, so long outputs do not crowd out the
+    /// conversation; 0 keeps them whole
+    #[arg(long, default_value_t = model::TOOL_CHARS_DEFAULT)]
+    pub tool_chars: u32,
+    /// Read the last N records instead of from --offset
+    #[arg(long, value_name = "N", conflicts_with_all = ["offset", "around"])]
+    pub tail: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -233,6 +272,23 @@ pub enum RemoteCmd {
         /// Upload even if the remote binary is identical
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub action: Option<SkillAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillAction {
+    /// Write it to ~/.agents/skills/sessift (Codex, Pi, OpenCode, Grok) and link it from
+    /// ~/.claude/skills (Claude Code). Run again after upgrading sessift
+    Install {
+        /// Install into this skills directory instead; repeatable
+        #[arg(long, value_name = "DIR")]
+        dir: Vec<std::path::PathBuf>,
     },
 }
 
@@ -305,6 +361,21 @@ pub async fn run(cli: Cli) -> Result<i32> {
             emit(&pick::shell_snippet(args.shell, &args.key)?);
             Ok(0)
         }
+        Command::Skill(args) => match args.action {
+            None => {
+                emit(crate::skill::SKILL_MD);
+                Ok(0)
+            }
+            Some(SkillAction::Install { dir }) => {
+                let home = std::env::var_os("HOME")
+                    .filter(|h| !h.is_empty())
+                    .ok_or_else(|| anyhow!("HOME is not set"))?;
+                for line in crate::skill::install(std::path::Path::new(&home), &dir)? {
+                    println!("{line}");
+                }
+                Ok(0)
+            }
+        },
         Command::Broker(cmd) => broker_cmd(&paths, cmd, Format::resolve(cli.format)).await,
         Command::Index(args) => {
             let paths = paths.clone();
@@ -336,6 +407,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 | Command::Init(_)
                 | Command::Broker(_)
                 | Command::Shell(_)
+                | Command::Skill(_)
                 | Command::Index(_) => {
                     unreachable!()
                 }
@@ -387,10 +459,19 @@ impl FilterArgs {
             project: self.project.clone(),
             cwd: self.cwd.as_deref().map(absolute_path),
             role,
-            session_id,
+            session_id: session_id.clone(),
             since_ms: time(&self.since, "since")?,
             until_ms: time(&self.until, "until")?,
             kind: (!self.kind.is_empty()).then(|| self.kind.join(",")),
+            // A session asked for by id is shown even when it is the caller's own.
+            exclude_sessions: if self.include_current {
+                Vec::new()
+            } else {
+                current_sessions()
+                    .into_iter()
+                    .filter(|id| Some(id) != session_id.as_ref())
+                    .collect()
+            },
         })
     }
 }
@@ -426,15 +507,14 @@ async fn search(ctx: &Ctx, args: SearchArgs) -> Result<i32> {
             Op::Search(request.clone())
         })
         .await;
-    let hits = merge_hits(&outcomes, request.limit as usize);
+    let mut hits = merge_hits(&outcomes, request.limit as usize);
+    // Inside one session the best hits read best in order, as a timeline.
+    if args.session.is_some() {
+        hits.sort_by_key(|h| h.item.ts_ms);
+    }
     let values = || hits.iter().map(output::hit_json).collect::<Vec<_>>();
     match ctx.format {
-        Format::Text => {
-            emit(&output::render_hits(&hits, &request.query));
-            if hits.is_empty() && outcomes.iter().any(|o| o.result.is_ok()) {
-                eprintln!("{}", Style::stderr().dim("no matches"));
-            }
-        }
+        Format::Text => emit(&output::render_hits(&hits, &request.query)),
         Format::Jsonl => emit(&output::jsonl(&values())),
         Format::Json => emit(&format!(
             "{}\n",
@@ -444,6 +524,20 @@ async fn search(ctx: &Ctx, args: SearchArgs) -> Result<i32> {
                 "machines": outcomes.iter().map(output::machine_json).collect::<Vec<_>>(),
             })
         )),
+    }
+    // Empty output alone does not tell "nothing found" from "nothing asked".
+    if hits.is_empty() && ctx.format != Format::Json {
+        let answered: Vec<&str> = outcomes
+            .iter()
+            .filter(|o| o.result.is_ok())
+            .map(|o| o.machine.as_str())
+            .collect();
+        if !answered.is_empty() {
+            eprintln!(
+                "{}",
+                Style::stderr().dim(&format!("no matches on {}", answered.join(", ")))
+            );
+        }
     }
     Ok(ctx.finish(&outcomes))
 }
@@ -511,33 +605,112 @@ async fn sessions(ctx: &Ctx, args: SessionsArgs) -> Result<i32> {
 }
 
 async fn read(ctx: &Ctx, args: ReadArgs) -> Result<i32> {
-    let machines = ctx.config().select(&args.sel.machines)?;
-    let request = ReadRequest {
-        session_id: args.session_id.clone(),
-        source_path: args.path.clone(),
-        offset: args.offset,
-        limit: args.limit,
-        max_chars: args.max_chars,
+    let mut machines = ctx.config().select(&args.sel.machines)?;
+    let (mut offset, mut limit) = (args.offset, args.limit);
+    if let Some(n) = args.tail {
+        // A page past the end costs nothing and tells how long the session is.
+        let probe = ReadRequest {
+            session_id: args.session_id.clone(),
+            source_path: args.path.clone(),
+            offset: u32::MAX,
+            limit: 1,
+            max_chars: model::MAX_CHARS_MIN,
+            tool_chars: None,
+        };
+        let outcomes = ctx
+            .runner
+            .run(&machines, ctx.timeout(&args.sel), |_| {
+                Op::Read(probe.clone())
+            })
+            .await;
+        let found = outcomes.iter().find_map(|o| match &o.result {
+            Ok(response) => match &response.reply {
+                Reply::Page(page) if page.session_id == args.session_id => page
+                    .total
+                    .filter(|total| *total > 0)
+                    .map(|total| (o.machine.clone(), total)),
+                _ => None,
+            },
+            Err(_) => None,
+        });
+        let Some((machine, total)) = found else {
+            if ctx.finish(&outcomes) == 0 {
+                let names: Vec<&str> = outcomes.iter().map(|o| o.machine.as_str()).collect();
+                eprintln!(
+                    "sessift: session {} not found on {}",
+                    args.session_id,
+                    names.join(", ")
+                );
+            }
+            return Ok(1);
+        };
+        machines = vec![machine];
+        limit = n.clamp(1, model::READ_LIMIT_MAX);
+        offset = total.saturating_sub(limit);
+    }
+    let op = match &args.around {
+        Some(record_id) => {
+            let before = (args.limit / 4).min(model::CONTEXT_SIDE_MAX);
+            let request = ContextRequest {
+                record_id: record_id.clone(),
+                session_id: Some(args.session_id.clone()),
+                before,
+                after: args
+                    .limit
+                    .saturating_sub(before + 1)
+                    .min(model::CONTEXT_SIDE_MAX),
+                max_chars: args.max_chars,
+                tool_chars: (args.tool_chars > 0).then_some(args.tool_chars),
+            };
+            request.validate().map_err(|e| anyhow!(e))?;
+            Op::Context(request)
+        }
+        None => {
+            let request = ReadRequest {
+                session_id: args.session_id.clone(),
+                source_path: args.path.clone(),
+                offset,
+                limit,
+                max_chars: args.max_chars,
+                tool_chars: (args.tool_chars > 0).then_some(args.tool_chars),
+            };
+            request.validate().map_err(|e| anyhow!(e))?;
+            Op::Read(request)
+        }
     };
-    request.validate().map_err(|e| anyhow!(e))?;
     let outcomes = ctx
         .runner
-        .run(&machines, ctx.timeout(&args.sel), |_| {
-            Op::Read(request.clone())
-        })
+        .run(&machines, ctx.timeout(&args.sel), |_| op.clone())
         .await;
     // Without -m the session is looked up on every default machine; the first in
-    // configured order that knows it wins.
+    // configured order that knows it wins. Record ids are per machine, so a page for
+    // another session is some other machine's record with the same id.
     let found = outcomes.iter().find_map(|o| match &o.result {
         Ok(response) => match &response.reply {
-            Reply::Page(page) if page.total.unwrap_or(0) > 0 || !page.records.is_empty() => {
-                Some((o.machine.clone(), page.clone()))
+            Reply::Page(page)
+                if page.session_id == args.session_id
+                    && (page.total.unwrap_or(0) > 0 || !page.records.is_empty()) =>
+            {
+                Some((o, page.clone()))
             }
             _ => None,
         },
         Err(_) => None,
     });
-    let code = ctx.finish(&outcomes);
+    // Around a record, the machines that do not have it answer with errors; not worth a warning
+    // once one did.
+    let code = match found {
+        Some((outcome, _)) if args.around.is_some() => ctx.finish(std::slice::from_ref(outcome)),
+        _ => ctx.finish(&outcomes),
+    };
+    let found = found.map(|(outcome, mut page)| {
+        // Servers from before `--around` leave next_offset out.
+        if page.next_offset.is_none() {
+            let end = page.offset + page.records.len() as u32;
+            page.next_offset = page.total.filter(|total| end < *total).map(|_| end);
+        }
+        (outcome.machine.clone(), page)
+    });
     let Some((machine, page)) = found else {
         if code == 0 {
             let names: Vec<&str> = outcomes.iter().map(|o| o.machine.as_str()).collect();
@@ -550,7 +723,27 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<i32> {
         return Ok(1);
     };
     match ctx.format {
-        Format::Text => emit(&output::render_page(&machine, &page, args.limit)),
+        Format::Text => {
+            // Whatever shaped this page shapes the next one too.
+            let mut next = String::new();
+            if limit != model::READ_LIMIT_DEFAULT {
+                next.push_str(&format!(" -n {limit}"));
+            }
+            if args.max_chars != model::MAX_CHARS_DEFAULT {
+                next.push_str(&format!(" --max-chars {}", args.max_chars));
+            }
+            if args.tool_chars != model::TOOL_CHARS_DEFAULT {
+                next.push_str(&format!(" --tool-chars {}", args.tool_chars));
+            }
+            if let Some(path) = &args.path {
+                next.push_str(&format!(" --path {}", pick::quote(path, ShellKind::Sh)));
+            }
+            // Text is the default only in a terminal.
+            if !std::io::stdout().is_terminal() {
+                next.push_str(" --format text");
+            }
+            emit(&output::render_page(&machine, &page, &next))
+        }
         Format::Jsonl => {
             let mut values: Vec<_> = page.records.iter().map(output::record_json).collect();
             values.push(json!({
@@ -581,6 +774,11 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// What the user calls the machine (`label` in the config), to match "my Mac mini" to an id.
+fn machine_label(config: &Config, id: &str) -> Option<String> {
+    config.machine(id).and_then(|m| m.label.clone())
+}
+
 fn describe_transport(config: &Config, id: &str, via: Option<Via>) -> String {
     if id == LOCAL {
         return "in-process".into();
@@ -607,7 +805,11 @@ async fn machines(ctx: &Ctx, args: MachinesArgs) -> Result<i32> {
                 .map(|o| (o.machine.as_str(), o.via))
                 .collect();
             emit(&output::render_machines(&outcomes, |id| {
-                describe_transport(ctx.config(), id, vias.get(id).copied())
+                let transport = describe_transport(ctx.config(), id, vias.get(id).copied());
+                match machine_label(ctx.config(), id) {
+                    Some(label) => format!("{label} · {transport}"),
+                    None => transport,
+                }
             }));
         }
         Format::Jsonl | Format::Json => {
@@ -615,6 +817,7 @@ async fn machines(ctx: &Ctx, args: MachinesArgs) -> Result<i32> {
                 .iter()
                 .map(|o| {
                     let mut value = output::machine_json(o);
+                    value["label"] = json!(machine_label(ctx.config(), &o.machine));
                     value["transport"] = json!(describe_transport(ctx.config(), &o.machine, None));
                     if let Ok(response) = &o.result
                         && let Reply::Info(info) = &response.reply
@@ -682,6 +885,14 @@ async fn doctor(ctx: &Ctx, args: DoctorArgs) -> Result<i32> {
             " (missing: run `sessift init`)"
         }
     );
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
+        && let Some(path) = crate::skill::stale(std::path::Path::new(&home))
+    {
+        println!(
+            "  skill {} is from another version: run `sessift skill install`",
+            path.display()
+        );
+    }
     let sample = SearchRequest::new("error");
     for id in ids {
         println!();

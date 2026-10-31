@@ -123,6 +123,8 @@ impl Loader {
             offset,
             limit,
             max_chars,
+            // The reader folds tool output and shows it whole on demand.
+            tool_chars: None,
         };
         match self.one(&key.machine, Op::Read(request)).await? {
             Reply::Page(page) => Ok(page),
@@ -139,6 +141,7 @@ impl Loader {
                 before: 1,
                 after: 10,
                 max_chars: 8000,
+                tool_chars: None,
             };
             match self.one(&key.key.machine, Op::Context(request)).await {
                 Ok(Reply::Page(page)) => {

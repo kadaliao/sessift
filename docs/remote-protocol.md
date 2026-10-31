@@ -110,7 +110,7 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 
 参数：`query`（必填）、`limit`（1～200，默认 20）、`snippet_chars`（16～2000，默认 240）、`filters`、`unique_sessions`（默认 `false`，为 `true` 时每个会话只返回分数最高的一条，交互界面用它）。
 
-`filters` 各字段都可省略：`source`、`project`、`cwd`、`role`、`session_id`、`since_ms`、`until_ms`。
+`filters` 各字段都可省略：`source`、`project`、`cwd`、`role`、`session_id`、`since_ms`、`until_ms`、`kind`、`exclude_sessions`。`exclude_sessions` 是会话 ID 列表，这些会话连同从它们派生的子 agent、fork 会话（按 `parent` 递归）都不返回；命令行在 agent 里运行时用它排除 agent 自己的会话。旧版服务端会忽略这个字段。
 
 旧版服务端不认识 `unique_sessions` 会直接忽略，所以客户端拿到结果后仍按会话去重一次。
 
@@ -137,7 +137,7 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 
 ### `read`
 
-参数：`session_id`（必填）、`source_path`、`offset`（默认 0）、`limit`（1～500，默认 50）、`max_chars`（整页正文字符预算，256～200000，默认 16000）。
+参数：`session_id`（必填）、`source_path`、`offset`（默认 0）、`limit`（1～500，默认 50）、`max_chars`（整页正文字符预算，256～200000，默认 16000）、`tool_chars`（可选：分配预算之前，每条工具调用和工具输出先截到这么多字符，免得长输出挤掉对话；不填就不截。命令行默认 1500，交互界面不填。旧版服务端会忽略）。
 
 ```json
 {"kind":"page","session_id":"a1b2…","source_path":"/Users/…","offset":0,"total":192,"next_offset":3,
@@ -151,9 +151,11 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 
 某条记录前后的上下文，用来在预览里直接显示搜索命中的位置。
 
-参数：`record_id`（必填，来自搜索结果）、`session_id`（可选，缩小查找范围）、`before`（0～100，默认 3）、`after`（0～100，默认 8）、`max_chars`（同 `read`）。
+参数：`record_id`（必填，来自搜索结果）、`session_id`（可选，给了就核对：记录不属于这个会话时按找不到处理）、`before`（0～100，默认 3）、`after`（0～100，默认 8）、`max_chars`、`tool_chars`（同 `read`）。
 
-回复是一个 `page`，记录按时间顺序排列；字符预算优先分给命中的那条，不会被前面的记录挤掉。`offset` 是这批记录在会话中的起始位置（后端知道时），`next_offset` 恒为 `null`。
+`record_id` 里编的是这台机器索引里的内部会话号，换一台机器可能对上别的会话，所以要跨机器查找时一定带上 `session_id`。0.2.0 及更早的服务端不做这个核对，客户端只接受 `session_id` 对得上的结果。
+
+回复是一个 `page`，记录按时间顺序排列。字符预算先给命中的那条，再给用户和助手的记录、最后给工具记录，同一类里离命中近的先给；两端一个字也没分到的记录不返回。`offset` 是这批记录在会话中的起始位置，和 `read` 一样跨文件计数（Codex 拆成多个文件的会话），`next_offset` 指向这批之后的记录，可以接着用 `read` 读。0.2.0 及更早的服务端 `next_offset` 恒为 `null`，客户端按 `offset` 加记录数补上。
 
 旧版服务端会回 `unsupported`，客户端此时退回用 `read` 显示会话开头。
 

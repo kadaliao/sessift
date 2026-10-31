@@ -9,7 +9,8 @@
 - 阶段 3（搜索质量）完成了第 1～5 步和收尾，已合并到 main 并推送，两台机器已装上。结果见 `docs/plan.md` 的"阶段 3 结果"：评测 MRR@10 0.815 → 0.898，会话列表默认只列对话，新增 Grok 来源，边打字边搜。
 - 2026-10-31 交互界面加了搜索框里的 Alt-s/t/m/a 筛选和鼠标支持，并发布第一个版本 v0.1.0（GitHub Release，附 macOS arm64 二进制）。
 - 2026-10-31 可以用 Homebrew 安装：`brew install kadaliao/tap/sessift`，个人 tap 仓库 https://github.com/kadaliao/homebrew-tap （`Formula/sessift.rb`，直接装 Release 里的 arm64 二进制）。项目还没有许可证、也没有知名度，进不了 homebrew-core。
-- 2026-10-31 新增 herdr 插件（`herdr/`，`prefix+m` 打开浮层，`sessift pick --herdr` 选中后在 herdr 里恢复），随 v0.2.0 发布（GitHub Release 和 Homebrew tap 已更新）。本机从 GitHub 装了插件，键绑在 dotfiles 里。改插件时先 `herdr plugin uninstall sessift`，再 `herdr plugin link <仓库>/herdr`，改完换回来。agent skill 的方案在 `docs/plan.md` 的"阶段 5"，未实施。
+- 2026-10-31 新增 herdr 插件（`herdr/`，`prefix+m` 打开浮层，`sessift pick --herdr` 选中后在 herdr 里恢复），随 v0.2.0 发布（GitHub Release 和 Homebrew tap 已更新）。本机从 GitHub 装了插件，键绑在 dotfiles 里。改插件时先 `herdr plugin uninstall sessift`，再 `herdr plugin link <仓库>/herdr`，改完换回来。
+- 2026-10-31 v0.3.0：agent skill（`sessift skill install`，本机已装）；agent 里运行时自动排除当前会话；`read --around`、`--tail`、`--tool-chars`；jsonl 时间改成带时区的本地时间。三个子 agent 试用过，见 `docs/plan.md` 的"阶段 5"。服务端也改了（`tool_chars`、`context` 的核对和 `next_offset`），mm 已同步更新。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
@@ -43,6 +44,7 @@
 | `src/pick.rs` | 恢复命令、按 shell 转义、剪贴板、shell 快捷键脚本 |
 | `src/herdr.rs` | `pick --herdr`：选中后经 herdr 命令行恢复（跳到已开的 pane、浮层下的空闲 shell、或新 tab） |
 | `herdr/` | herdr 插件：manifest、`open.sh`（打开 popup）、`picker.sh`（找 sessift 并运行） |
+| `src/skill.rs`、`skills/sessift/SKILL.md` | agent skill：SKILL.md 编进二进制，`sessift skill install` 写到 `~/.agents/skills` 并链接到 `~/.claude/skills` |
 | `src/output.rs` | CLI 的 text、jsonl、json 输出 |
 | `src/text.rs`、`src/timefmt.rs` | CJK 安全的截断与宽度、终端控制字符清理；时间解析与格式化 |
 | `src/install.rs` | `sessift remote install` |
@@ -101,4 +103,6 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - **发版的二进制会带上本机路径**：Rust 标准库和依赖的源码路径会编进二进制（几百处家目录路径）。发版时用 `RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=sessift"`，加单独的 `CARGO_TARGET_DIR` 编译（免得冲掉平时的编译缓存），打包前用 `strings` 确认没有家目录路径。
 - **shell 快捷键只对之后启动的 shell 生效**：herdr 的 pane 会活好几天，改了 `fish_user_key_bindings` 后旧 pane 要 `exec fish`。agent pane 里的 Alt-M 被 agent 收走，所以 herdr 里另用插件。
 - **herdr 插件的 popup 没有 pane ID**：拿不到 `HERDR_PANE_ID`，浮层下面的 pane 从 `HERDR_PLUGIN_CONTEXT_JSON` 的 `focused_pane_id` 取。popup 不能用 `pane send-keys` 操作，测试时直接在普通 pane 里跑 `sessift pick --herdr` 并手动设这个环境变量；popup 用 socket 的 `popup.close` 关。herdr 命令出错时把 JSON 错误写在 stdout、退出码 1。
+- **agent 里跑 sessift 会自动排除当前会话**：`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`、`GROK_SESSION_ID` 里的会话（连同子 agent）不出现在 `search`/`sessions` 里。在 Claude 里调试搜索结果时记得这一点，需要时加 `--include-current`。`tests/cli.rs` 会清掉这些变量。
+- **record_id 只在本机有效**：里面编的是本机索引的内部会话号，`context` 请求要带 `session_id`，服务端会核对。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。

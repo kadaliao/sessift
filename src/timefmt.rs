@@ -62,10 +62,19 @@ fn parse_time_at(text: &str, now: i64, tz: &TimeZone) -> Result<i64> {
     Err(invalid())
 }
 
-/// UTC RFC 3339 with second precision, for machine-readable output.
+/// RFC 3339 in local time with its offset, second precision, for machine-readable output:
+/// the same clock as the text output, and still unambiguous.
 pub fn rfc3339(ms: i64) -> String {
+    rfc3339_in(ms, &TimeZone::system())
+}
+
+fn rfc3339_in(ms: i64, tz: &TimeZone) -> String {
     Timestamp::from_second(ms.div_euclid(1000))
-        .map(|ts| ts.to_string())
+        .map(|ts| {
+            ts.to_zoned(tz.clone())
+                .strftime("%Y-%m-%dT%H:%M:%S%:z")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -151,7 +160,15 @@ mod tests {
 
     #[test]
     fn formats() {
-        assert_eq!(rfc3339(1_705_314_600_123), "2024-01-15T10:30:00Z");
+        assert_eq!(
+            rfc3339_in(1_705_314_600_123, &TimeZone::UTC),
+            "2024-01-15T10:30:00+00:00"
+        );
+        let shanghai = TimeZone::get("Asia/Shanghai").unwrap();
+        assert_eq!(
+            rfc3339_in(1_705_314_600_123, &shanghai),
+            "2024-01-15T18:30:00+08:00"
+        );
         assert_eq!(human_duration(Duration::from_millis(250)), "250ms");
         assert_eq!(human_duration(Duration::from_secs(5)), "5s");
         assert_eq!(human_duration(Duration::from_millis(1500)), "1.5s");

@@ -18,6 +18,7 @@ pub mod pick;
 pub mod proto;
 pub mod rpc;
 pub mod server;
+pub mod skill;
 pub mod text;
 pub mod timefmt;
 pub mod tui;

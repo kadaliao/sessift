@@ -170,6 +170,67 @@ pub fn fit_page(records: &mut [RecordView], max_chars: usize) -> usize {
     records.len()
 }
 
+/// Cut each tool call and tool output to `max` characters.
+pub fn cap_tools(records: &mut [RecordView], max: usize) {
+    for record in records {
+        if matches!(record.role.as_str(), "tool_use" | "tool_result")
+            && char_len(&record.text) > max
+        {
+            record.text = truncate_chars(&record.text, max).0;
+            record.truncated = true;
+        }
+    }
+}
+
+/// Share `max_chars` out from record `anchor` outwards: the anchor, then what people and
+/// assistants wrote, then tool calls and output, each nearest first. The conversation around
+/// a hit survives long tool output, and the far ends give way. Returns the records worth
+/// showing: the far ends that got nothing at all are left out.
+pub fn budget_around(
+    records: &mut [RecordView],
+    anchor: usize,
+    max_chars: usize,
+) -> std::ops::Range<usize> {
+    let n = records.len();
+    if n == 0 {
+        return 0..0;
+    }
+    let anchor = anchor.min(n - 1);
+    let mut nearest = Vec::with_capacity(n);
+    for d in 1..n {
+        if d <= anchor {
+            nearest.push(anchor - d);
+        }
+        if anchor + d < n {
+            nearest.push(anchor + d);
+        }
+    }
+    let is_tool = |i: &usize| matches!(records[*i].role.as_str(), "tool_use" | "tool_result");
+    let mut order = vec![anchor];
+    order.extend(nearest.iter().copied().filter(|i| !is_tool(i)));
+    order.extend(nearest.iter().copied().filter(is_tool));
+    let mut remaining = max_chars;
+    let mut starved = vec![false; n];
+    for i in order {
+        let record = &mut records[i];
+        let len = char_len(&record.text);
+        if len <= remaining {
+            remaining -= len;
+            continue;
+        }
+        starved[i] = remaining == 0 && i != anchor;
+        record.text = truncate_chars(&record.text, remaining).0;
+        record.truncated = true;
+        remaining = 0;
+    }
+    let start = (0..anchor).find(|&i| !starved[i]).unwrap_or(anchor);
+    let end = (anchor + 1..n)
+        .rev()
+        .find(|&i| !starved[i])
+        .map_or(anchor + 1, |i| i + 1);
+    start..end
+}
+
 pub fn apply_page_budget(records: &mut [RecordView], max_chars: usize) {
     let mut remaining = max_chars;
     for record in records {
@@ -188,6 +249,65 @@ pub fn apply_page_budget(records: &mut [RecordView], max_chars: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_of(role: &str, text: &str) -> RecordView {
+        RecordView {
+            record_id: String::new(),
+            ts_ms: 0,
+            role: role.into(),
+            tool_name: None,
+            text: text.into(),
+            total_chars: char_len(text) as u64,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn tool_records_are_capped() {
+        let mut page = vec![
+            record_of("user", "abcdef"),
+            record_of("tool_result", "abcdef"),
+            record_of("tool_use", "ab"),
+        ];
+        cap_tools(&mut page, 3);
+        assert_eq!(page[0].text, "abcdef");
+        assert_eq!((page[1].text.as_str(), page[1].truncated), ("abc", true));
+        assert_eq!((page[2].text.as_str(), page[2].truncated), ("ab", false));
+    }
+
+    #[test]
+    fn the_budget_spreads_out_from_the_anchor() {
+        let texts = ["aaaa", "bbbb", "HHHH", "cccc", "dddddddd", "eeee"];
+        let mut page: Vec<_> = texts.iter().map(|t| record_of("user", t)).collect();
+        // Anchor 2 first, then 1, 3, 0, 4: 4 + 4 + 4 + 4 + 2 of the 8 left for 4.
+        let keep = budget_around(&mut page, 2, 18);
+        assert_eq!(keep, 0..5, "the last one got nothing and is left out");
+        assert_eq!(page[0].text, "aaaa");
+        assert_eq!(page[1].text, "bbbb");
+        assert_eq!(page[3].text, "cccc");
+        assert_eq!((page[4].text.as_str(), page[4].truncated), ("dd", true));
+
+        let mut page: Vec<_> = texts.iter().map(|t| record_of("user", t)).collect();
+        let keep = budget_around(&mut page, 2, 5);
+        assert_eq!(keep, 1..3, "the anchor and one before it");
+        assert_eq!(page[2].text, "HHHH");
+        assert_eq!(page[1].text, "b");
+
+        // Tool output next to the anchor waits until the conversation further out is served.
+        let mut page = vec![
+            record_of("user", "question"),
+            record_of("tool_result", "a long tool output"),
+            record_of("assistant", "HIT"),
+            record_of("tool_use", "a long tool call"),
+            record_of("assistant", "answer"),
+        ];
+        let keep = budget_around(&mut page, 2, 3 + 8 + 6 + 2);
+        assert_eq!(keep, 0..5);
+        assert_eq!(page[0].text, "question");
+        assert_eq!(page[4].text, "answer");
+        assert_eq!(page[1].text, "a ");
+        assert_eq!(page[3].text, "", "starved, but kept: it is not at an end");
+    }
 
     #[test]
     fn pages_stop_where_the_budget_runs_out() {

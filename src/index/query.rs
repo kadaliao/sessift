@@ -177,6 +177,7 @@ impl NativeIndex {
         };
         let rank = Rank::current();
         let sessions = open.store.session_ids(&req.filters)?;
+        let exclude = open.store.excluded_ids(&req.filters.exclude_sessions)?;
         let weights: HashMap<i64, f32> = open
             .store
             .sessions_of_kinds(&["guardian", "exec", "subagent"])?
@@ -188,6 +189,7 @@ impl NativeIndex {
             prefix: prefix.as_deref(),
             query: &req.query,
             sessions: sessions.as_deref(),
+            exclude: &exclude,
             role,
             since_ms: req.filters.since_ms,
             until_ms: req.filters.until_ms,
@@ -345,9 +347,16 @@ impl NativeIndex {
         let open = guard.as_ref().expect("prepared");
         let (sess, pos, part) = parse_record_id(&req.record_id)
             .ok_or_else(|| anyhow!("record {} not found", req.record_id))?;
+        // Record ids hold this machine's internal session number; on another machine the same
+        // number is some other session.
         let session = open
             .store
             .session(sess)?
+            .filter(|s| {
+                req.session_id
+                    .as_ref()
+                    .is_none_or(|sid| *sid == s.session_id)
+            })
             .ok_or_else(|| anyhow!("record {} not found", req.record_id))?;
         let anchor = open
             .store
@@ -357,11 +366,25 @@ impl NativeIndex {
         let count = anchor.seq - from + 1 + req.after;
         let rows = open.store.records(sess, from, count)?;
         let records = views(&session, &rows, req.max_chars as usize)?;
+        // Offsets count across every file of a split session, as `read` does.
+        let files = open.store.session_files(&session)?;
+        let earlier: u64 = files
+            .iter()
+            .take_while(|f| f.id != session.id)
+            .map(|f| f.records)
+            .sum();
+        let total: u64 = files
+            .iter()
+            .map(|f| f.records)
+            .sum::<u64>()
+            .max(session.records);
+        let offset = earlier + from as u64;
+        let end = offset + records.len() as u64;
         Ok(Page {
             session_id: session.session_id.clone(),
-            offset: from,
-            total: Some(session.records as u32),
-            next_offset: None,
+            offset: offset as u32,
+            total: Some(total as u32),
+            next_offset: (end < total).then_some(end as u32),
             source_path: session.path,
             records,
         })

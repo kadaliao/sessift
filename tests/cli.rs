@@ -143,6 +143,15 @@ probe_after_idle = "300ms"
             .env_remove("SESSIFT_FIXTURE")
             .env_remove("SESSIFT_FIXTURE_DELAY_MS")
             .env_remove("SESSIFT_TEST_NOISE");
+        // Running the tests from an agent must not hide its session from them.
+        for var in [
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "PI_SESSION_ID",
+            "GROK_SESSION_ID",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd
     }
 
@@ -261,6 +270,106 @@ fn sessions_merge_by_recency_and_page() {
 }
 
 #[test]
+fn the_calling_agents_sessions_are_left_out() {
+    let env = TestEnv::new("");
+    let out = env
+        .cmd(&["sessions", "--format", "json"])
+        .env("CLAUDE_CODE_SESSION_ID", "loc-1")
+        .env("CODEX_THREAD_ID", "b-2")
+        .output()
+        .unwrap();
+    let out: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Remote machines get the exclusion with the request.
+    assert_eq!(ids(&out, "session_id"), vec!["a:a-1", "b:b-1"]);
+
+    let out = env
+        .cmd(&["search", "deploy", "--include-current", "--format", "json"])
+        .env("CLAUDE_CODE_SESSION_ID", "loc-1")
+        .output()
+        .unwrap();
+    let out: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(ids(&out, "session_id").contains(&"local:loc-1".to_string()));
+
+    // Asked for by id, the caller's own session is shown.
+    let out = env
+        .cmd(&["sessions", "--session", "loc-1", "--format", "json"])
+        .env("CLAUDE_CODE_SESSION_ID", "loc-1")
+        .output()
+        .unwrap();
+    let out: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(ids(&out, "session_id"), vec!["local:loc-1"]);
+}
+
+#[test]
+fn read_around_a_search_hit() {
+    let env = TestEnv::new("");
+    // Only b has the record; the others answer with errors, which are not worth a warning.
+    let out = env.run(&[
+        "read", "b-1", "--around", "r60", "-n", "8", "--format", "json",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let page: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(page["machine"], "b");
+    assert_eq!(page["offset"], 58, "a quarter of the page before the hit");
+    let records = page["records"].as_array().unwrap();
+    assert_eq!(records.len(), 8);
+    assert_eq!(records[2]["record_id"], "r60");
+    // Filled in by the client when the server leaves it out.
+    assert_eq!(page["next_offset"], 66);
+
+    let missing = env.run(&["read", "b-1", "--around", "r999"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("r999"), "{}", stderr(&missing));
+    let both = env.run(&["read", "b-1", "--around", "r1", "--offset", "3"]);
+    assert_eq!(
+        both.status.code(),
+        Some(2),
+        "--around and --offset conflict"
+    );
+}
+
+#[test]
+fn read_the_end_of_a_session() {
+    let env = TestEnv::new("");
+    let page = env.json(&["read", "b-1", "--tail", "5"]);
+    assert_eq!(page["machine"], "b");
+    assert_eq!(page["offset"], 115);
+    assert_eq!(page["records"].as_array().unwrap().len(), 5);
+    assert_eq!(page["records"][4]["text"], "第 119 条记录");
+    assert_eq!(page["next_offset"], Value::Null);
+    let missing = env.run(&["read", "nope", "--tail", "5"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("not found"));
+}
+
+#[test]
+fn hits_inside_one_session_come_in_time_order() {
+    let env = TestEnv::new("");
+    let out = env.json(&["search", "broker", "--session", "loc-1"]);
+    let records: Vec<_> = out["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["record_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(records, ["r1", "r2"]);
+}
+
+#[test]
+fn an_empty_search_says_so() {
+    let env = TestEnv::new("");
+    let out = env.run(&["search", "nothing-like-this", "--format", "jsonl"]);
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        stderr(&out).contains("no matches on local, a, b"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn read_finds_the_machine_and_pages() {
     let env = TestEnv::new("");
     let page = env.json(&["read", "b-1", "--limit", "50"]);
@@ -276,7 +385,7 @@ fn read_finds_the_machine_and_pages() {
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(text.contains("第 0 条记录"), "{text}");
     assert!(
-        text.contains("next: sessift read b-1 -m b --offset 2 --limit 2"),
+        text.contains("next: sessift read b-1 -m b --offset 2 -n 2 --format text"),
         "{text}"
     );
 

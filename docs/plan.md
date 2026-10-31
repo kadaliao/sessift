@@ -51,7 +51,7 @@ sessift 是一个命令行工具：搜索、浏览本机和其他机器上的 AI
 | 2 | 自研索引：Claude / Codex / Pi / OpenCode 解析，增量入库，SQLite 会话表，Tantivy + 中英文混合分词（中文 bigram），正文按文件偏移按需读取，不复制原文 | 完成（2026-10-30）；2026-10-31 两台机器切换，memex 适配器已删除，memex 已卸载 |
 | 3 | 搜索质量：评测集、排序调优、会话种类过滤、Grok 来源、边打字边搜；向量检索视评测结果再定 | 第 1～5、7 步完成（2026-10-31），向量检索待定，见下文"阶段 3" |
 | 4 | 稳定化：文件监听增量索引、打包（Homebrew）、文档、长时间运行测试 | 未开始 |
-| 5 | agent 支持（MCP / skill）、herdr 支持、app | herdr 插件完成（2026-10-31）；agent skill 方案见下文"阶段 5" |
+| 5 | agent 支持（MCP / skill）、herdr 支持、app | herdr 插件（v0.2.0）、agent skill（v0.3.0）完成（2026-10-31），见下文"阶段 5"；app 未开始 |
 
 ## 阶段 1：远程查询层
 
@@ -480,12 +480,21 @@ memex 适配器（`src/backend/memex.rs` 和它的测试）已删除；配置里
 - "空闲 shell"的判断：前台进程组等于 pane 的 shell 进程，并且进程名是已知的 shell。只看前者不够：直接以命令启动的 pane（插件 pane、`type = "pane"` 的命令）里，那个命令本身就是"shell"。
 - 测试：`src/herdr.rs` 用假的 herdr 脚本（记录参数、返回预设 JSON）覆盖各分支；在真实 herdr 里用 fixture 后端的假会话（恢复命令是 `echo`）在两个后台 tab 里跑过四条路径。
 
-### agent skill（方案，未实施）
+### agent skill（2026-10-31）
 
-值得做，工作量小。agent 不知道 sessift 存在、什么时候该用；用户说"上次在 mm 上怎么修的""继续昨天那个任务"时，agent 应该能跨机器、跨 agent 去查。不用 MCP：命令行已有 jsonl 输出，不用常驻进程，各家 agent 都能调。
+值得做，工作量小。agent 不知道 sessift 存在，也不知道什么时候该用；用户说"上次在另一台机器上怎么修的""继续昨天那个任务"时，应该能跨机器、跨 agent 去查。不用 MCP：命令行已有 jsonl 输出，不用常驻进程，各家 agent 都能调。
 
-- `skills/sessift/SKILL.md`，`sessift skill install` 用 `include_str!` 编进二进制（skill 和二进制版本一致），写到本机装了的 agent 的 skill 目录（`~/.claude/skills/`、`~/.codex/skills/`），`--print` 只输出。
-- 内容：什么时候用；`sessift search … --format jsonl` 找，`sessift read <id> -m <机器>` 分页读、只读需要的部分；回答写明机器、时间、标题和恢复命令；不大段贴原文，密钥打码，只读不改。
-- 实施前要解决：
-  1. 当前会话会搜到自己（"评测会被自己污染"那条）。看各 agent 能不能拿到当前会话 ID（herdr 下有 `herdr pane get $HERDR_PANE_ID` 的 `agent_session`），能拿到就给 search 加 `--exclude-session`，否则 skill 里写明按 cwd 和最近活跃时间排除。
-  2. `read` 每页的字符预算和单条截断是否适合放进 agent 的上下文，必要时加 `--max-chars`。
+- `skills/sessift/SKILL.md`，编进二进制（`src/skill.rs`），`sessift skill` 输出，`sessift skill install` 写到 `~/.agents/skills/sessift/`（Codex、Pi、OpenCode、Grok 读这里），并在 `~/.claude/skills/` 放一个指向它的链接（Claude Code 只读自己的目录）。已经是别处的链接就不动。`sessift doctor` 发现装的版本和二进制里的不一样时提示重装。
+- **自动排除当前会话**：在 Claude 里试搜时，当前会话排在第 2、3 位（命令里就有查询词）。各家 agent 会把会话 ID 传给子进程：Claude Code `CLAUDE_CODE_SESSION_ID`、Codex `CODEX_THREAD_ID`（从一个 Codex 会话的输出核实过就是会话 ID）、Pi `PI_SESSION_ID`（bash 工具里设置）、Grok `GROK_SESSION_ID`（可能只给 hooks）。OpenCode 没有。`search`、`sessions` 把这些会话连同按 `parent` 递归找到的子 agent、fork 一起排除（`Filters::exclude_sessions`），`--include-current` 关掉。搜索里用一个"必须不含"的会话集合，不把其余几千个会话列成白名单：后者每次多 5ms，前者测不出差别。
+- **`read --around <record_id>`**：会话动辄几千条记录，从头翻太浪费，用协议里已有的 `context`。顺带修了 `context` 的两个问题：`next_offset` 恒为空（现在和 `read` 一样跨文件计数，可以接着读）；`record_id` 里是本机的内部会话号，另一台机器可能对上别的会话，现在带了 `session_id` 就核对，客户端也只收会话 ID 对得上的结果。
+- **试用**：三个子 agent 只照着 SKILL.md 用 sessift 回答问题（本机一个、mm 两个），都找到了正确的会话和结论。按它们的反馈改了：
+  - `next:` 提示丢了 `--format text`，agent 在管道里接着读就变成了 JSONL。现在带上所有影响分页的参数。
+  - 预算被长工具输出吃光，命中前的上文被清空，助手的结论只剩"0 of 63 chars"。现在每条工具记录先截到 1500 字（`--tool-chars`，请求字段 `tool_chars`，交互界面不截），`--around` 的预算先给命中的那条，再给用户和助手的文字，最后给工具记录，都是由近及远；两端一个字没分到的不返回。同一个例子从 7 条记录、上文全空，变成 28 条、助手文字全部完整。
+  - 结论常在会话末尾：加 `read --tail N`（先读一次"末尾之后"的空页拿总数）。
+  - jsonl 的时间是 UTC、文本是本地时间，跨天时容易报错日期：jsonl 改成带时区的本地时间。
+  - 零命中时 stdout 为空、stderr 也没有提示，分不清没命中还是出错：现在 stderr 写明查过哪些机器。
+  - jsonl 里 `session_id`、`record_id` 挪到前面（agent 用 `cut` 截断时丢过 `record_id`）。
+  - 用户说"Mac mini"没法对应到机器 ID：`machines` 输出配置里的 `label`。
+  - SKILL.md 补上：确定会话后用 `search --session` 看会话内的命中时间线；结论常在工具调用里（提交说明、写入的文档），不要只搜 `--role assistant`；用户说的是现象，会话里写的是原因和标识符；`--kind conversation` 去掉子 agent 噪音；`message_count` 和记录数不是一回事。
+- **第二轮试用**（改完之后，问 mm 上另一个项目的事，CLAUDE.md 里没有线索）：找到了会话，答案完整。它报告 `--tool-chars` 没效果、预算还是按顺序花：截断和分配都在服务端做，mm 当时还是 0.2.0，会忽略新字段。所以发版要同时 `remote install`。这样做的好处是长输出在远端就截掉了，不占慢链路。另外按它的反馈，`search --session` 改成先按分数取前 N 条、再按时间排列，SKILL.md 说的"时间线"才名副其实；SKILL.md 加了先用小页读、`--project` 最好用、按标题扫 `sessions`、只看对话用 `--tool-chars 100`。
+- 留给后续：`--per-session` 的片段取得分最高的那条，可能只含一个查询词，看不出会话是否相关（可以优先选覆盖查询词最多的记录）；`read` 按角色过滤。

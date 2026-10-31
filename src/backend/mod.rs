@@ -109,6 +109,9 @@ impl Backend {
                 }
                 .map_err(failed)?;
                 page.records.truncate(req.limit as usize);
+                if let Some(cap) = req.tool_chars {
+                    text::cap_tools(&mut page.records, cap as usize);
+                }
                 let kept = text::fit_page(&mut page.records, req.max_chars as usize);
                 if kept < page.records.len() {
                     page.records.truncate(kept);
@@ -125,17 +128,21 @@ impl Backend {
                 .map_err(failed)?;
                 let side = (req.before + req.after + 1) as usize;
                 page.records.truncate(side);
-                // Spend the budget on the anchor first so it is never crowded out.
+                if let Some(cap) = req.tool_chars {
+                    text::cap_tools(&mut page.records, cap as usize);
+                }
+                // The anchor gets the budget first, then its neighbours, nearest first.
                 let anchor = page
                     .records
                     .iter()
                     .position(|r| r.record_id == req.record_id)
                     .unwrap_or(0);
-                if !page.records.is_empty() {
-                    page.records.rotate_left(anchor);
-                    text::apply_page_budget(&mut page.records, req.max_chars as usize);
-                    page.records.rotate_right(anchor);
-                }
+                let keep = text::budget_around(&mut page.records, anchor, req.max_chars as usize);
+                page.records.truncate(keep.end);
+                page.records.drain(..keep.start);
+                page.offset += keep.start as u32;
+                let end = page.offset + page.records.len() as u32;
+                page.next_offset = page.total.filter(|total| end < *total).map(|_| end);
                 Ok(Reply::Page(page))
             }
             Op::Ping | Op::Info | Op::BrokerStatus => Err(CallError::new(

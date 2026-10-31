@@ -110,17 +110,18 @@ pub fn terminal_width() -> usize {
 
 pub fn hit_json(hit: &Located<SearchHit>) -> Value {
     let h = &hit.item;
+    // The ids `read` needs come first, so a line cut short still has them.
     json!({
         "machine": hit.machine,
+        "session_id": h.session_id,
+        "record_id": h.record_id,
         "score": (h.score as f64 * 1000.0).round() / 1000.0,
         "ts": rfc3339(h.ts_ms),
         "source": h.source,
-        "session_id": h.session_id,
         "project": h.project,
         "role": h.role,
         "snippet": h.snippet,
         "source_path": h.source_path,
-        "record_id": h.record_id,
     })
 }
 
@@ -453,7 +454,8 @@ pub fn render_sessions(sessions: &[Located<SessionSummary>]) -> String {
     out
 }
 
-pub fn render_page(machine: &str, page: &Page, limit: u32) -> String {
+/// `next_flags` follow `--offset` in the suggested command for the next page.
+pub fn render_page(machine: &str, page: &Page, next_flags: &str) -> String {
     let style = Style::stdout();
     let width = terminal_width();
     let mut out = String::new();
@@ -516,13 +518,8 @@ pub fn render_page(machine: &str, page: &Page, limit: u32) -> String {
     };
     if let Some(next) = page.next_offset {
         footer.push_str(&format!(
-            " · next: sessift read {} -m {machine} --offset {next}{}",
+            " · next: sessift read {} -m {machine} --offset {next}{next_flags}",
             text::sanitize_line(&page.session_id),
-            if limit == crate::model::READ_LIMIT_DEFAULT {
-                String::new()
-            } else {
-                format!(" --limit {limit}")
-            }
         ));
     }
     out.push_str(&style.dim(&footer));

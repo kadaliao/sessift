@@ -421,8 +421,14 @@ impl Store {
     }
 
     /// Ids of the sessions a search may return, or `None` when no session-level filter is set.
+    /// Excluded sessions are left to [`Store::excluded_ids`]: listing every other session
+    /// would make each search filter on thousands of ids.
     pub fn session_ids(&self, filters: &Filters) -> Result<Option<Vec<i64>>> {
-        let (clause, args) = session_where(filters, false, "all");
+        let filters = Filters {
+            exclude_sessions: Vec::new(),
+            ..filters.clone()
+        };
+        let (clause, args) = session_where(&filters, false, "all");
         if clause.is_empty() {
             return Ok(None);
         }
@@ -431,6 +437,21 @@ impl Store {
             .prepare_cached(&format!("SELECT id FROM sessions {clause}"))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
         Ok(Some(rows.collect::<rusqlite::Result<_>>()?))
+    }
+
+    /// Ids of these sessions and, transitively, of the subagents and forks started from them.
+    pub fn excluded_ids(&self, session_ids: &[String]) -> Result<Vec<i64>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["(?)"; session_ids.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "WITH RECURSIVE gone(sid) AS (VALUES {marks} \
+             UNION SELECT s.session_id FROM sessions s JOIN gone ON s.parent = gone.sid) \
+             SELECT id FROM sessions WHERE session_id IN (SELECT sid FROM gone)"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(session_ids), |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn counts_by_source(&self) -> Result<Vec<(String, u64, u64)>> {
@@ -596,6 +617,16 @@ fn session_where(
     if let Some(sid) = &filters.session_id {
         parts.push("session_id = ?".into());
         args.push(Value::Text(sid.clone()));
+    }
+    if !filters.exclude_sessions.is_empty() {
+        // The excluded sessions and, transitively, the subagents and forks started from them.
+        let marks = vec!["(?)"; filters.exclude_sessions.len()].join(", ");
+        parts.push(format!(
+            "session_id NOT IN (WITH RECURSIVE gone(sid) AS (VALUES {marks} \
+             UNION SELECT s.session_id FROM sessions s JOIN gone ON s.parent = gone.sid) \
+             SELECT sid FROM gone)"
+        ));
+        args.extend(filters.exclude_sessions.iter().cloned().map(Value::Text));
     }
     if with_time {
         if let Some(since) = filters.since_ms {

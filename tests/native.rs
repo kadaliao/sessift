@@ -536,10 +536,64 @@ fn a_codex_session_split_over_files_reads_as_one() {
     let half = total / 2;
     assert_eq!(page.records[0].text, page.records[half].text);
     assert_ne!(page.records[0].record_id, page.records[half].record_id);
+    let all = page.records.clone();
     // Paging crosses from one file into the next.
     read.offset = half as u32 - 1;
     read.limit = 2;
     let page = env.index.read(&read).unwrap();
     assert_eq!(page.records.len(), 2);
     assert_eq!(page.next_offset, Some(half as u32 + 1));
+
+    // Around a record of the second file, offsets count from the start of the first, so
+    // reading on with `next_offset` continues right after the window.
+    let mut context = ContextRequest::new(all[half + 1].record_id.clone());
+    context.session_id = Some(sid.into());
+    context.before = 1;
+    context.after = 1;
+    let window = env.index.context(&context).unwrap();
+    assert_eq!(window.offset, half as u32);
+    assert_eq!(window.total, Some(total as u32));
+    let ids: Vec<_> = window.records.iter().map(|r| &r.record_id).collect();
+    let want: Vec<_> = all[half..half + 3].iter().map(|r| &r.record_id).collect();
+    assert_eq!(ids, want);
+    assert_eq!(window.next_offset, Some(half as u32 + 3));
+
+    // A record id names an internal session number; asking for another session finds nothing
+    // instead of that number's records.
+    context.session_id = Some("some-other-session".into());
+    assert!(env.index.context(&context).is_err());
+}
+
+#[test]
+fn excluding_a_session_drops_its_subagents_too() {
+    let env = env();
+    let shop = "5f0c6a1e-8b2d-4e7f-a913-2c4d6e8f0a1b";
+    let claude = |exclude: Vec<String>| {
+        env.index
+            .sessions(&SessionsRequest {
+                filters: Filters {
+                    source: Some("claude".into()),
+                    kind: Some("all".into()),
+                    exclude_sessions: exclude,
+                    ..Filters::default()
+                },
+                ..SessionsRequest::default()
+            })
+            .unwrap()
+    };
+    let all = claude(Vec::new());
+    let left = claude(vec![shop.into(), "not-a-session".into()]);
+    assert_eq!(left.len(), all.len() - 2, "the session and its subagent");
+    assert!(
+        left.iter()
+            .all(|s| s.session_id != shop && s.project != "shop-api")
+    );
+
+    // The subagent's review mentions the idempotency key.
+    let mut req = SearchRequest::new("idempotency");
+    let hits = env.index.search(&req).unwrap();
+    assert!(hits.iter().any(|h| h.project == "shop-api"), "{hits:#?}");
+    req.filters.exclude_sessions = vec![shop.into()];
+    let hits = env.index.search(&req).unwrap();
+    assert!(hits.iter().all(|h| h.project != "shop-api"), "{hits:#?}");
 }
