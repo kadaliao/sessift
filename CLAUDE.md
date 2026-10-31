@@ -11,6 +11,7 @@
 - 2026-10-31 可以用 Homebrew 安装：`brew install kadaliao/tap/sessift`，个人 tap 仓库 https://github.com/kadaliao/homebrew-tap （`Formula/sessift.rb`，直接装 Release 里的 arm64 二进制）。项目还没有许可证、也没有知名度，进不了 homebrew-core。
 - 2026-10-31 新增 herdr 插件（`herdr/`，`prefix+m` 打开浮层，`sessift pick --herdr` 选中后在 herdr 里恢复），随 v0.2.0 发布（GitHub Release 和 Homebrew tap 已更新）。本机从 GitHub 装了插件，键绑在 dotfiles 里。改插件时先 `herdr plugin uninstall sessift`，再 `herdr plugin link <仓库>/herdr`，改完换回来。
 - 2026-10-31 v0.3.0：agent skill（`sessift skill install`，本机已装）；agent 里运行时自动排除当前会话；`read --around`、`--tail`、`--tool-chars`；jsonl 时间改成带时区的本地时间。三个子 agent 试用过，见 `docs/plan.md` 的"阶段 5"。服务端也改了（`tool_chars`、`context` 的核对和 `next_offset`），mm 已同步更新。
+- 2026-10-31 v0.3.1：修复 zsh 快捷键打开界面后收不到按键（crossterm `use-dev-tty`）；README 改用带按键的 GIF（`scripts/screenshots/run.sh` 生成）。mm 上 brew 装的 sessift 和远端服务都已更新，mm 也装了 skill、herdr 插件，配置里能查本机（本机 `~/.sessift/bin/sessift` 链接到 `~/.local/bin/sessift`）。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
