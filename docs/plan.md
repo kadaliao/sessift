@@ -498,3 +498,9 @@ memex 适配器（`src/backend/memex.rs` 和它的测试）已删除；配置里
   - SKILL.md 补上：确定会话后用 `search --session` 看会话内的命中时间线；结论常在工具调用里（提交说明、写入的文档），不要只搜 `--role assistant`；用户说的是现象，会话里写的是原因和标识符；`--kind conversation` 去掉子 agent 噪音；`message_count` 和记录数不是一回事。
 - **第二轮试用**（改完之后，问 mm 上另一个项目的事，CLAUDE.md 里没有线索）：找到了会话，答案完整。它报告 `--tool-chars` 没效果、预算还是按顺序花：截断和分配都在服务端做，mm 当时还是 0.2.0，会忽略新字段。所以发版要同时 `remote install`。这样做的好处是长输出在远端就截掉了，不占慢链路。另外按它的反馈，`search --session` 改成先按分数取前 N 条、再按时间排列，SKILL.md 说的"时间线"才名副其实；SKILL.md 加了先用小页读、`--project` 最好用、按标题扫 `sessions`、只看对话用 `--tool-chars 100`。
 - 留给后续：`--per-session` 的片段取得分最高的那条，可能只含一个查询词，看不出会话是否相关（可以优先选覆盖查询词最多的记录）；`read` 按角色过滤。
+
+### README 改用 GIF（2026-10-31）
+
+- 三张截图换成三个 GIF：shell 里 Alt-M 搜索并恢复、全文阅读、herdr 里 prefix+m 的浮层。每按一次键截一帧，按了什么键画在窗口下方。`scripts/screenshots/record.py` 在独立的 tmux 里驱动真实界面，herdr 那段用假 HOME 里单独的 herdr（只链接本仓库的插件，不碰正在用的 herdr）；`gif.py` 用 Playwright 渲染，ffmpeg 合成，三个一共约 1.3MB。README 同时精简了一半。
+- 录的时候发现 **zsh 的 Alt-M 打开界面后收不到任何按键**：zsh 的 widget 里标准输入是 `/dev/null`，crossterm 退而打开 `/dev/tty`，macOS 的 kqueue 监听不了它。crossterm 打开 `use-dev-tty` 特性（改用 poll）后正常。fish 不受影响。
+

@@ -51,7 +51,7 @@
 | `tests/` | `cli.rs` 端到端（本地命令代替 SSH），`native.rs` 自研索引，`protocol.rs` 协议层；`fixtures/home/` 是虚构的各来源会话 |
 | `scripts/bench.py` | 命令行延迟基准；装了 memex 时同时测它作对照 |
 | `scripts/eval.py` | 搜索质量评测，数据在 `~/.sessift/eval/`（真实内容，不进仓库） |
-| `scripts/screenshots/` | README 截图：`demo.py` 造虚构会话，`shoot.py` 在 tmux 里操作界面并截屏，`render.py` 渲染成 PNG，`run.sh` 串起来 |
+| `scripts/screenshots/` | README 的 GIF：`demo.py` 造虚构会话，`record.py` 在独立 tmux 里操作真实界面（还有一个假 HOME 里的 herdr），每按一次键截一帧，`gif.py` 用 Playwright 渲染、窗口下方画出按键，ffmpeg 合成 GIF，`term.py` 是共用的 ANSI 转 HTML，`run.sh` 串起来 |
 
 ## 常用命令
 
@@ -67,7 +67,7 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 
 - 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致）。
 - 搜索质量评测 `scripts/eval.py`：一组"凭印象找某个会话"的查询（标注了目标会话）和一组主题查询，输出 MRR@10、前 10 命中数、前 10 里自动线程的个数和延迟。查询格式见脚本开头。排序参数可以用 `SESSIFT_RANK` 临时覆盖（如 `--env SESSIFT_RANK=cross=0,title=0`），在同一份索引上比较。
-- README 的截图用 `scripts/screenshots/run.sh` 重新生成：虚构的会话分在两台假机器上，在独立的 tmux 里跑真实的界面并截屏，再用无界面 Chrome 渲染（需要 tmux、Chrome、ImageMagick、Pillow 和 Maple Mono NF CN 字体）。改了界面后重新生成。
+- README 的 GIF 用 `scripts/screenshots/run.sh` 重新生成：虚构的会话分在两台假机器上，在独立的 tmux 里跑真实的界面（herdr 那段用假 HOME 里单独的 herdr，只链接本仓库的插件），每按一次键截一帧，按键显示在窗口下方（需要 tmux、herdr、Chrome、ffmpeg、Playwright 和 Maple Mono NF CN 字体）。场景和每帧停留时间在 `record.py` 里改。改了界面后重新生成。
 
 - 发版后更新 Homebrew：在 tap 的本地副本（`brew --repository kadaliao/tap`，或 `gh repo clone kadaliao/homebrew-tap`）里把 `Formula/sessift.rb` 的 `url` 改成新版本的包、`sha256` 换成 Release 附带的 `.sha256` 文件里的值，提交推送；然后 `brew audit --strict --online kadaliao/tap/sessift` 和 `brew test kadaliao/tap/sessift` 检查。新版 Homebrew 不加载没信任的 tap，`brew audit` 会直接拒绝，用全名 `brew install` 一次（会自动信任）或 `brew trust kadaliao/tap` 之后再跑。
 
@@ -105,4 +105,6 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - **herdr 插件的 popup 没有 pane ID**：拿不到 `HERDR_PANE_ID`，浮层下面的 pane 从 `HERDR_PLUGIN_CONTEXT_JSON` 的 `focused_pane_id` 取。popup 不能用 `pane send-keys` 操作，测试时直接在普通 pane 里跑 `sessift pick --herdr` 并手动设这个环境变量；popup 用 socket 的 `popup.close` 关。herdr 命令出错时把 JSON 错误写在 stdout、退出码 1。
 - **agent 里跑 sessift 会自动排除当前会话**：`CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`、`GROK_SESSION_ID` 里的会话（连同子 agent）不出现在 `search`/`sessions` 里。在 Claude 里调试搜索结果时记得这一点，需要时加 `--include-current`。`tests/cli.rs` 会清掉这些变量。
 - **record_id 只在本机有效**：里面编的是本机索引的内部会话号，`context` 请求要带 `session_id`，服务端会核对。
+- **zsh 的快捷键 widget 里标准输入是 `/dev/null`**，crossterm 只能打开 `/dev/tty`，而 macOS 的 kqueue 监听不了它，界面能画出来但收不到按键。所以 crossterm 开了 `use-dev-tty` 特性（改用 poll）。fish 的 `(…)` 继承真正的终端，不受影响。
+- **tmux 的 `new-session -e PATH=…` 不一定生效**：录 GIF 的 shell 在自己的 rc 里设 PATH，tmux 服务器用干净的环境启动（也避免继承 `HERDR_*` 连到真实的 herdr）。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。
