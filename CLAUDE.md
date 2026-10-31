@@ -8,6 +8,7 @@
 - 2026-10-31 本机和 mm 都已卸载 memex（连同 herdr 插件），会话搜索只用 sessift。
 - 阶段 3（搜索质量）完成了第 1～5 步和收尾，已合并到 main 并推送，两台机器已装上。结果见 `docs/plan.md` 的"阶段 3 结果"：评测 MRR@10 0.815 → 0.898，会话列表默认只列对话，新增 Grok 来源，边打字边搜。
 - 2026-10-31 交互界面加了搜索框里的 Alt-s/t/m/a 筛选和鼠标支持，并发布第一个版本 v0.1.0（GitHub Release，附 macOS arm64 二进制）。
+- 2026-10-31 可以用 Homebrew 安装：`brew install kadaliao/tap/sessift`，个人 tap 仓库 https://github.com/kadaliao/homebrew-tap （`Formula/sessift.rb`，直接装 Release 里的 arm64 二进制）。项目还没有许可证、也没有知名度，进不了 homebrew-core。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
@@ -62,6 +63,8 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - 集成测试用 `fixture` 后端（`SESSIFT_FIXTURE=<json>`）提供确定数据，`SESSIFT_FIXTURE_DELAY_MS` 注入延迟，`SESSIFT_TEST_NOISE=1` 模拟远端 shell 杂讯。自研索引的测试用 `tests/fixtures/home/` 里的虚构会话（布局和真实 HOME 一致）。
 - 搜索质量评测 `scripts/eval.py`：一组"凭印象找某个会话"的查询（标注了目标会话）和一组主题查询，输出 MRR@10、前 10 命中数、前 10 里自动线程的个数和延迟。查询格式见脚本开头。排序参数可以用 `SESSIFT_RANK` 临时覆盖（如 `--env SESSIFT_RANK=cross=0,title=0`），在同一份索引上比较。
 - README 的截图用 `scripts/screenshots/run.sh` 重新生成：虚构的会话分在两台假机器上，在独立的 tmux 里跑真实的界面并截屏，再用无界面 Chrome 渲染（需要 tmux、Chrome、ImageMagick、Pillow 和 Maple Mono NF CN 字体）。改了界面后重新生成。
+
+- 发版后更新 Homebrew：在 tap 的本地副本（`brew --repository kadaliao/tap`，或 `gh repo clone kadaliao/homebrew-tap`）里把 `Formula/sessift.rb` 的 `url` 改成新版本的包、`sha256` 换成 Release 附带的 `.sha256` 文件里的值，提交推送；然后 `brew audit --strict --online kadaliao/tap/sessift` 和 `brew test kadaliao/tap/sessift` 检查。新版 Homebrew 不加载没信任的 tap，`brew audit` 会直接拒绝，用全名 `brew install` 一次（会自动信任）或 `brew trust kadaliao/tap` 之后再跑。
 
 测试里所有数据都在临时目录（`SESSIFT_HOME`），不会碰真实的 `~/.sessift`；测试结束会停掉自己起的 broker。
 

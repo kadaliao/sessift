@@ -13,7 +13,29 @@
 
 ## 安装
 
-macOS（Apple Silicon）从 [Releases](https://github.com/kadaliao/sessift/releases) 下载 `sessift-<版本>-aarch64-apple-darwin.tar.gz`，解压后把 `sessift` 放进 `PATH`：
+### Homebrew（推荐）
+
+macOS（Apple Silicon）：
+
+```sh
+brew install kadaliao/tap/sessift
+```
+
+装的是 Releases 里的预编译版本，不用编译。第一次要用 `kadaliao/tap/sessift` 这个全名：Homebrew 会自动加上 tap [kadaliao/homebrew-tap](https://github.com/kadaliao/homebrew-tap) 并信任这个 formula。只 `brew tap` 再用短名字 `brew install sessift`，新版 Homebrew 会以"未信任的 tap"为由拒绝，这时改用全名，或先 `brew trust kadaliao/tap`。
+
+装好以后直接用 `sessift` 这个名字：
+
+```sh
+brew upgrade sessift      # 升级到最新版本
+brew uninstall sessift    # 卸载
+brew untap kadaliao/tap   # 不再需要这个 tap 时
+```
+
+卸载不会删掉索引和配置（`~/.sessift`），不要了就手动删这个目录。
+
+### 下载预编译版本
+
+从 [Releases](https://github.com/kadaliao/sessift/releases) 下载 `sessift-<版本>-aarch64-apple-darwin.tar.gz`，解压后把 `sessift` 放进 `PATH`：
 
 ```sh
 tar xzf sessift-*-aarch64-apple-darwin.tar.gz
@@ -22,13 +44,19 @@ install -m 755 sessift ~/.local/bin/sessift
 
 用浏览器下载时 macOS 可能拦截这个未签名的程序，执行 `xattr -d com.apple.quarantine sessift` 后再运行。
 
-其他平台用 Rust 从源码安装：
+### 从源码安装
+
+Intel Mac、Linux 等其他平台，用 Rust 从源码安装：
 
 ```sh
 cargo install --git https://github.com/kadaliao/sessift --locked
 ```
 
-然后：
+### 开始使用
+
+远端机器不需要装 Homebrew，用 `sessift remote install` 从本机装过去，见[多台机器](#多台机器)。
+
+装好后：
 
 ```sh
 sessift init     # 生成配置 ~/.sessift/config.toml
