@@ -7,6 +7,7 @@
 - 已完成：远程查询层、交互界面（Alt-M），阶段 2 自研索引（`src/index/`）。本机和 mm 都已切到 native，和 memex 的延迟、结果集对比做完，memex 适配器已删除。结果见 `docs/plan.md` 的阶段 2。
 - 2026-10-31 本机和 mm 都已卸载 memex（连同 herdr 插件），会话搜索只用 sessift。
 - 阶段 3（搜索质量）完成了第 1～5 步和收尾，已合并到 main 并推送，两台机器已装上。结果见 `docs/plan.md` 的"阶段 3 结果"：评测 MRR@10 0.815 → 0.898，会话列表默认只列对话，新增 Grok 来源，边打字边搜。
+- 2026-10-31 交互界面加了搜索框里的 Alt-s/t/m/a 筛选和鼠标支持，并发布第一个版本 v0.1.0（GitHub Release，附 macOS arm64 二进制）。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
@@ -86,4 +87,5 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - **开发时别直接索引全部真实数据**：用 `tests/fixtures/home` 或临时 HOME 里的部分文件（`cp -c` 克隆）加临时 `SESSIFT_HOME`，全量只在最后验证性能时跑。
 - **改了解析器版本（`VERSION`）后，新旧两个二进制会互相把对方的结果重新解析一遍**（版本不同就整个来源重解析）。开发时用临时 `SESSIFT_HOME` 跑新版本，确定后再装到 `~/.local/bin`。
 - **评测会被自己污染**：在 Claude 里读会话、写查询的那个会话和它的子 agent 会话，正文里就有目标会话的内容和查询词，会排到最前。把这些会话的 ID 加进 `~/.sessift/eval/exclude.txt`。
+- **发版的二进制会带上本机路径**：Rust 标准库和依赖的源码路径会编进二进制（几百处家目录路径）。发版时用 `RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=sessift"`，加单独的 `CARGO_TARGET_DIR` 编译（免得冲掉平时的编译缓存），打包前用 `strings` 确认没有家目录路径。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。
