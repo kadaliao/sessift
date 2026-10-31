@@ -1,13 +1,14 @@
 //! Drawing. Pure functions of the app state, except for layout caches kept on the state.
 
+use crossterm::event::KeyCode;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, Focus, MachineState, PreviewState, Range, Row};
+use super::app::{App, Filter, Focus, MachineState, PreviewState, Range, Regions, Row};
 use super::md::{self, Para, RecordOpts};
 use super::theme;
 use crate::text::{self, display_width, fit_width};
@@ -73,12 +74,13 @@ pub fn middle(s: &str, width: usize) -> String {
     )
 }
 
-/// Draw everything; returns the screen row of the first list entry (for mouse clicks).
-pub fn draw(frame: &mut Frame, app: &mut App) -> u16 {
+/// Draw everything, and note where things went for mouse clicks.
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.regions = Regions::default();
     let area = frame.area();
     if app.reader.is_some() {
         draw_reader(frame, area, app);
-        return u16::MAX;
+        return;
     }
     let outer = area.inner(ratatui::layout::Margin {
         horizontal: 1,
@@ -93,23 +95,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> u16 {
         Constraint::Length(1),
     ])
     .areas(outer);
+    app.regions.search = search;
     draw_search(frame, search, app);
     draw_status(frame, status, app);
     let list_area = if app.split && body.width >= 60 {
         let [list, preview] =
             Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .areas(body);
+        app.regions.preview = preview;
         draw_preview_pane(frame, preview, app);
         list
     } else {
         body
     };
+    app.regions.list = list_area;
     draw_list(frame, list_area, app);
     draw_footer(frame, footer, app);
     if app.peek {
         draw_peek(frame, area, app);
+    } else if app.menu.is_some() {
+        draw_menu(frame, area, app);
     }
-    list_area.y
+}
+
+fn hover_bg() -> Style {
+    Style::default().bg(theme::SELECTED_BG)
 }
 
 fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
@@ -140,7 +150,7 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_status(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut left = vec![
         Span::styled(
             if app.matches_mode {
@@ -175,41 +185,78 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    let chip = |key: &str, label: String, active: bool| {
-        vec![
-            Span::styled(format!("{key} "), theme::faint()),
-            Span::styled(
-                format!("{label} ▾"),
+    // Filters, right-aligned; each one opens its dropdown on click.
+    let in_query = app.focus == Focus::Query;
+    let mut chips: Vec<(Filter, String, bool)> = Vec::new();
+    if app.query.trim().is_empty() {
+        chips.push((Filter::Kinds, app.kinds_label().into(), app.all_kinds));
+    }
+    chips.push((
+        Filter::Machine,
+        app.machine_label(),
+        app.machine_choice.is_some(),
+    ));
+    chips.push((Filter::Source, app.source_label(), app.source.is_some()));
+    chips.push((
+        Filter::Time,
+        app.range.label().into(),
+        app.range != Range::All,
+    ));
+    const GAP: u16 = 3;
+    let chips: Vec<(Filter, Line)> = chips
+        .into_iter()
+        .map(|(filter, label, active)| {
+            let key = if in_query {
+                format!("Alt-{} ", filter.key())
+            } else {
+                format!("{} ", filter.key())
+            };
+            let label = Span::styled(
+                format!("{} ▾", text::sanitize_line(&label)),
                 if active {
                     theme::accent()
                 } else {
                     theme::muted()
                 },
-            ),
-        ]
-    };
-    let mut right = Vec::new();
-    if app.query.trim().is_empty() {
-        right.extend(chip("a", app.kinds_label().to_string(), app.all_kinds));
-        right.push(Span::raw("   "));
+            );
+            (
+                filter,
+                Line::from(vec![Span::styled(key, theme::faint()), label]),
+            )
+        })
+        .collect();
+    let total: u16 = chips.iter().map(|(_, l)| l.width() as u16).sum::<u16>()
+        + GAP * (chips.len() as u16).saturating_sub(1);
+    let start = area
+        .right()
+        .saturating_sub(total)
+        .max(area.x + 10.min(area.width));
+    let mut x = start;
+    for (filter, line) in chips {
+        let width = line.width() as u16;
+        let rect = Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        }
+        .intersection(area);
+        let open = app.menu.as_ref().is_some_and(|m| m.filter == filter);
+        let hovered = app.mouse.is_some_and(|p| rect.contains(p));
+        let line = if open || hovered {
+            line.style(hover_bg())
+        } else {
+            line
+        };
+        frame.render_widget(Paragraph::new(line), rect);
+        app.regions.chips.push((rect, filter));
+        x = x.saturating_add(width + GAP);
     }
-    right.extend(chip("m", app.machine_label(), app.machine_choice.is_some()));
-    right.push(Span::raw("   "));
-    right.extend(chip("s", app.source_label(), app.source.is_some()));
-    right.push(Span::raw("   "));
-    right.extend(chip(
-        "t",
-        app.range.label().to_string(),
-        app.range != Range::All,
-    ));
-    let right_width: u16 = right.iter().map(|s| s.width() as u16).sum();
-    let [l, r] =
-        Layout::horizontal([Constraint::Min(10), Constraint::Length(right_width)]).areas(area);
-    frame.render_widget(Paragraph::new(Line::from(left)), l);
-    frame.render_widget(
-        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-        r,
-    );
+    let left_area = Rect {
+        width: start.saturating_sub(area.x + 1),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(Line::from(left)), left_area);
 }
 
 fn row_line(app: &App, row: &Row, width: usize, selected: bool, terms: &[String]) -> Line<'static> {
@@ -444,37 +491,99 @@ fn draw_peek(frame: &mut Frame, area: Rect, app: &mut App) {
         width,
         height,
     };
+    app.regions.peek = rect;
+    // The footer underneath does not apply while peeking.
+    app.regions.buttons.clear();
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::accent())
-        .title(Span::styled(" 速览 ", theme::bold()))
-        .title_bottom(Line::from(Span::styled(
-            " Enter 恢复  o 全文  j/k 滚动  n/p 下一条/上一条  Esc 关闭 ",
-            theme::muted(),
-        )));
+        .title(Span::styled(" 速览 ", theme::bold()));
     let inner = block.inner(rect).inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 0,
     });
     frame.render_widget(block, rect);
+    // Hints sit on the bottom border.
+    if rect.height >= 2 {
+        let bottom = Rect {
+            x: rect.x + 1,
+            y: rect.bottom() - 1,
+            width: rect.width.saturating_sub(2),
+            height: 1,
+        };
+        let mut spans = vec![Span::raw(" ")];
+        hints(
+            &mut spans,
+            bottom,
+            &[
+                ("Enter", "恢复", Some(KeyCode::Enter)),
+                ("o", "全文", Some(KeyCode::Char('o'))),
+                ("j/k", "滚动", None),
+                ("n", "下一条", Some(KeyCode::Char('n'))),
+                ("p", "上一条", Some(KeyCode::Char('p'))),
+                ("Esc", "关闭", Some(KeyCode::Esc)),
+            ],
+            app.mouse,
+            &mut app.regions.buttons,
+        );
+        spans.push(Span::raw(" "));
+        let line = Line::from(spans);
+        let used = Rect {
+            width: (line.width() as u16).min(bottom.width),
+            ..bottom
+        };
+        frame.render_widget(Paragraph::new(line), used);
+    }
     let lines = preview_lines(app, inner.width as usize);
     let mut scroll = app.preview_scroll;
     render_scrolled(frame, inner, lines, &mut scroll);
     app.preview_scroll = scroll;
 }
 
-fn hints(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (key, label) in pairs {
-        spans.push(Span::styled(key.to_string(), theme::accent()));
-        spans.push(Span::styled(format!(" {label}  "), theme::muted()));
+/// A hint: key, what it does, and the key a click presses (none for key groups like `j/k`).
+type Hint<'a> = (&'a str, &'a str, Option<KeyCode>);
+
+/// Append hints to `spans`, which start at the left of `area`; clickable ones go into `buttons`.
+fn hints(
+    spans: &mut Vec<Span<'static>>,
+    area: Rect,
+    pairs: &[Hint],
+    mouse: Option<Position>,
+    buttons: &mut Vec<(Rect, KeyCode)>,
+) {
+    let mut x = area
+        .x
+        .saturating_add(spans.iter().map(|s| s.width()).sum::<usize>() as u16);
+    for (i, &(key, label, press)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            x = x.saturating_add(2);
+        }
+        let width = (display_width(key) + 1 + display_width(label)) as u16;
+        let rect = Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        }
+        .intersection(area);
+        let bg = if press.is_some() && mouse.is_some_and(|p| rect.contains(p)) {
+            hover_bg()
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(key.to_string(), theme::accent().patch(bg)));
+        spans.push(Span::styled(format!(" {label}"), theme::muted().patch(bg)));
+        if let Some(code) = press {
+            buttons.push((rect, code));
+        }
+        x = x.saturating_add(width);
     }
-    spans
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut spans = Vec::new();
     if let Some((message, _)) = &app.status {
         if app.pending.is_some() {
@@ -487,26 +596,103 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "打印命令"
     };
-    spans.extend(match app.focus {
-        Focus::Query => hints(&[
-            ("输入", "搜索"),
-            ("↓/Enter", "选会话"),
-            ("Tab", "分栏预览"),
-            ("Esc", "清空/退出"),
-        ]),
-        Focus::List => hints(&[
-            ("Enter/r", "恢复"),
-            ("e", edit),
-            ("Space", "速览"),
-            ("Tab", "分栏"),
-            ("o", "全文"),
-            ("y/Y", "复制ID/命令"),
-            ("s/t/m/a", "来源/时间/机器/种类"),
-            ("/", "搜索"),
-            ("q", "退出"),
-        ]),
-    });
+    let filters = match (app.focus, app.query.trim().is_empty()) {
+        (Focus::Query, true) => "Alt-s/t/m/a",
+        (Focus::Query, false) => "Alt-s/t/m",
+        (Focus::List, true) => "s/t/m/a",
+        (Focus::List, false) => "s/t/m",
+    };
+    let pairs: Vec<Hint> = match app.focus {
+        Focus::Query => vec![
+            ("输入", "搜索", None),
+            ("↓/Enter", "选会话", Some(KeyCode::Enter)),
+            (filters, "筛选", None),
+            ("Tab", "分栏预览", Some(KeyCode::Tab)),
+            ("Esc", "清空/退出", Some(KeyCode::Esc)),
+        ],
+        Focus::List => vec![
+            ("Enter/r", "恢复", Some(KeyCode::Enter)),
+            ("e", edit, Some(KeyCode::Char('e'))),
+            ("Space", "速览", Some(KeyCode::Char(' '))),
+            ("Tab", "分栏", Some(KeyCode::Tab)),
+            ("o", "全文", Some(KeyCode::Char('o'))),
+            ("y/Y", "复制ID/命令", None),
+            (filters, "筛选", None),
+            ("/", "搜索", Some(KeyCode::Char('/'))),
+            ("q", "退出", Some(KeyCode::Char('q'))),
+        ],
+    };
+    hints(
+        &mut spans,
+        area,
+        &pairs,
+        app.mouse,
+        &mut app.regions.buttons,
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The dropdown of a filter, under its chip.
+fn draw_menu(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(menu) = &app.menu else {
+        return;
+    };
+    let Some(&(chip, _)) = app.regions.chips.iter().find(|(_, f)| *f == menu.filter) else {
+        return;
+    };
+    let label_w = menu
+        .options
+        .iter()
+        .map(|o| display_width(&text::sanitize_line(o)))
+        .max()
+        .unwrap_or(0);
+    let width = (label_w + 6) as u16;
+    let height = menu.options.len() as u16 + 2;
+    let rect = Rect {
+        x: chip.x.min(area.right().saturating_sub(width)).max(area.x),
+        y: chip.y + 1,
+        width,
+        height,
+    }
+    .intersection(area);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::faint());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let mut lines = Vec::new();
+    for (i, option) in menu.options.iter().enumerate() {
+        let current = i == menu.current;
+        let mark = if current { "✓ " } else { "  " };
+        let mut style = if current {
+            theme::accent()
+        } else {
+            Style::default()
+        };
+        if i == menu.hover {
+            style = style.patch(hover_bg());
+        }
+        lines.push(Line::styled(
+            format!(
+                " {mark}{} ",
+                text::pad(&text::sanitize_line(option), label_w)
+            ),
+            style,
+        ));
+        // One rect per option, even clipped ones, so indices line up.
+        app.regions.menu.push(
+            Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            }
+            .intersection(inner),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -651,30 +837,37 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         "打印命令"
     };
-    spans.extend(hints(&[
-        ("j/k", "滚动"),
-        ("d/u", "半页"),
-        ("g/G", "首尾"),
-        ("/", "查找"),
-        ("n/N", "下/上一个"),
-        (
-            "t",
-            if reader.expand_tools {
-                "收起工具"
-            } else {
-                "展开工具"
-            },
-        ),
-        ("Enter", "恢复"),
-        ("e", edit),
-        ("q", "返回"),
-    ]));
     let position = format!("{percent}%");
     let [l, r] = Layout::horizontal([
         Constraint::Min(10),
         Constraint::Length(position.len() as u16 + 1),
     ])
     .areas(footer);
+    hints(
+        &mut spans,
+        l,
+        &[
+            ("j/k", "滚动", None),
+            ("d/u", "半页", None),
+            ("g/G", "首尾", None),
+            ("/", "查找", Some(KeyCode::Char('/'))),
+            ("n/N", "下/上一个", None),
+            (
+                "t",
+                if reader.expand_tools {
+                    "收起工具"
+                } else {
+                    "展开工具"
+                },
+                Some(KeyCode::Char('t')),
+            ),
+            ("Enter", "恢复", Some(KeyCode::Enter)),
+            ("e", edit, Some(KeyCode::Char('e'))),
+            ("q", "返回", Some(KeyCode::Char('q'))),
+        ],
+        app.mouse,
+        &mut app.regions.buttons,
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)), l);
     frame.render_widget(
         Paragraph::new(Line::styled(position, theme::faint())).alignment(Alignment::Right),
@@ -757,5 +950,167 @@ mod tests {
         assert!(screen.contains("2m"));
         assert!(screen.contains("把 memex 做成交互界面"));
         assert!(screen.contains("全部来源"));
+    }
+
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn sessions_app(ids: &[(&str, &str)]) -> App {
+        let mut app = App::new(vec!["local".into(), "mm".into()], String::new(), true);
+        app.take_effects();
+        let generation = app.generation;
+        let sessions = ids
+            .iter()
+            .enumerate()
+            .map(|(i, (id, source))| crate::model::SessionSummary {
+                source: source.to_string(),
+                session_id: id.to_string(),
+                source_path: format!("/{id}"),
+                project: "p".into(),
+                cwd: None,
+                title: Some(format!("title {id}")),
+                started_ms: None,
+                last_ms: now_ms() - 60_000 * (i as i64 + 1),
+                message_count: Some(3),
+                kind: None,
+                resume_cmd: None,
+            })
+            .collect();
+        app.on_msg(super::super::load::Msg::Rows {
+            generation,
+            outcome: crate::fanout::Outcome {
+                machine: "local".into(),
+                result: Ok(crate::rpc::Response {
+                    reply: crate::proto::Reply::Sessions { sessions },
+                    took_ms: 1,
+                    wire_bytes: 1,
+                }),
+                elapsed: std::time::Duration::from_millis(3),
+                via: crate::fanout::Via::Local,
+            },
+        });
+        app
+    }
+
+    /// Draw, then return the cell where `needle` starts.
+    fn locate(terminal: &mut Terminal<TestBackend>, app: &mut App, needle: &str) -> (u16, u16) {
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let mut row = String::new();
+            let mut xs = Vec::new();
+            let mut x = 0;
+            while x < buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                for _ in symbol.chars() {
+                    xs.push(x);
+                }
+                row.push_str(symbol);
+                x += UnicodeWidthStr::width(symbol).max(1) as u16;
+            }
+            if let Some(byte) = row.find(needle) {
+                return (xs[row[..byte].chars().count()], y);
+            }
+        }
+        panic!("{needle} not on screen");
+    }
+
+    fn click(app: &mut App, (column, row): (u16, u16)) {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn mouse_opens_filter_menus_and_picks() {
+        let mut app = sessions_app(&[("a", "claude"), ("b", "codex")]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        // The search box has focus, so the chips show the Alt keys.
+        locate(&mut terminal, &mut app, "Alt-s 全部来源");
+        let chip = locate(&mut terminal, &mut app, "全部来源");
+        click(&mut app, chip);
+        assert_eq!(app.menu.as_ref().unwrap().filter, Filter::Source);
+        let current = locate(&mut terminal, &mut app, "✓ 全部来源");
+        assert!(current.1 > chip.1, "menu drops below the chip");
+        let options = &app.menu.as_ref().unwrap().options;
+        assert_eq!(options, &["全部来源", "claude", "codex"]);
+        let codex = app.regions.menu[2];
+        assert_eq!(codex.y, current.1 + 2);
+        click(&mut app, (codex.x + 3, codex.y));
+        assert!(app.menu.is_none());
+        assert_eq!(app.source.as_deref(), Some("codex"));
+        assert!(app.take_effects().iter().any(|e| matches!(e,
+            super::super::app::Effect::Fetch { op: crate::proto::Op::Sessions(req), .. }
+                if req.filters.source.as_deref() == Some("codex"))));
+
+        // A click outside closes the menu without touching what is under it.
+        let chip = locate(&mut terminal, &mut app, "全部时间");
+        click(&mut app, chip);
+        assert!(app.menu.is_some());
+        click(&mut app, (0, 0));
+        assert!(app.menu.is_none());
+        assert_eq!(app.range, Range::All);
+    }
+
+    #[test]
+    fn mouse_selects_double_click_resumes_and_hints_press_keys() {
+        let mut app = sessions_app(&[("a", "claude"), ("b", "codex")]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let second = locate(&mut terminal, &mut app, "title b");
+        click(&mut app, second);
+        assert_eq!(app.focus, Focus::List);
+        assert_eq!(app.selected, 1);
+        assert!(app.take_effects().is_empty(), "one click only selects");
+        click(&mut app, second);
+        assert!(app.take_effects().iter().any(|e| matches!(
+            e,
+            super::super::app::Effect::Command {
+                purpose: super::super::load::Purpose::Run,
+                ..
+            }
+        )));
+        app.pending = None;
+
+        // The list footer: Space peeks; Esc on the overlay's border closes it.
+        let peek = locate(&mut terminal, &mut app, "Space 速览");
+        click(&mut app, peek);
+        assert!(app.peek);
+        let close = locate(&mut terminal, &mut app, "Esc 关闭");
+        click(&mut app, close);
+        assert!(!app.peek);
+
+        // Clicking the search box puts the cursor where it was clicked.
+        app.query = "部署 vercel".into();
+        app.cursor = 0;
+        let box_at = locate(&mut terminal, &mut app, "vercel");
+        click(&mut app, (box_at.0 + 1, box_at.1));
+        assert_eq!(app.focus, Focus::Query);
+        assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn wheel_scrolls_what_is_under_the_mouse() {
+        let mut app = sessions_app(&[("a", "claude"), ("b", "codex"), ("c", "claude")]);
+        app.split = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let wheel = |app: &mut App, (column, row): (u16, u16)| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let list = app.regions.list;
+        let preview = app.regions.preview;
+        wheel(&mut app, (preview.x + 2, preview.y + 1));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.preview_scroll, 3);
+        wheel(&mut app, (list.x + 2, list.y));
+        assert_eq!(app.selected, 1);
     }
 }

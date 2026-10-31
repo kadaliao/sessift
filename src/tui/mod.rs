@@ -2,6 +2,7 @@
 //!
 //! It draws on /dev/tty, so a shell binding can capture stdout for the chosen command.
 //! Interaction follows memex: type to search, ↓ or Enter into the list, single keys there.
+//! The mouse works too: click filters, rows and hints; double-click resumes.
 
 pub mod app;
 pub mod load;
@@ -112,7 +113,6 @@ pub async fn run(runner: Arc<Runner>, options: TuiOptions) -> Result<Exit> {
     let mut fetches: Vec<JoinHandle<()>> = Vec::new();
     let mut preview: Option<(PreviewKey, JoinHandle<()>)> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(80));
-    let mut list_top = 0u16;
     let exit = loop {
         for effect in app.take_effects() {
             match effect {
@@ -155,13 +155,11 @@ pub async fn run(runner: Arc<Runner>, options: TuiOptions) -> Result<Exit> {
         if let Some(exit) = app.exit.take() {
             break exit;
         }
-        screen
-            .terminal
-            .draw(|frame| list_top = view::draw(frame, &mut app))?;
+        screen.terminal.draw(|frame| view::draw(frame, &mut app))?;
         tokio::select! {
             Some(event) = input.recv() => match event {
                 Event::Key(key) => app.on_key(key),
-                Event::Mouse(mouse) => app.on_mouse(mouse, list_top),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             },

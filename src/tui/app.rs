@@ -4,7 +4,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 
 use super::load::{Key, Msg, Preview, PreviewKey, Purpose};
@@ -18,6 +21,7 @@ pub const SEARCH_LIMIT: u32 = 80;
 const TYPING_PAUSE: Duration = Duration::from_millis(150);
 const PREVIEW_PAUSE: Duration = Duration::from_millis(60);
 const STATUS_FOR: Duration = Duration::from_secs(3);
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -48,15 +52,13 @@ pub enum Range {
 }
 
 impl Range {
-    pub fn next(self) -> Self {
-        match self {
-            Range::All => Range::Day,
-            Range::Day => Range::Week,
-            Range::Week => Range::Month,
-            Range::Month => Range::Quarter,
-            Range::Quarter => Range::All,
-        }
-    }
+    pub const CHOICES: [Range; 5] = [
+        Range::All,
+        Range::Day,
+        Range::Week,
+        Range::Month,
+        Range::Quarter,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -78,6 +80,74 @@ impl Range {
             Range::Quarter => 90,
         };
         Some(now_ms() - days * day)
+    }
+}
+
+/// A filter on the status line. Its letter works in the list, Alt plus the letter anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    Kinds,
+    Machine,
+    Source,
+    Time,
+}
+
+impl Filter {
+    pub fn key(self) -> char {
+        match self {
+            Filter::Kinds => 'a',
+            Filter::Machine => 'm',
+            Filter::Source => 's',
+            Filter::Time => 't',
+        }
+    }
+
+    fn from_key(c: char) -> Option<Self> {
+        [Filter::Kinds, Filter::Machine, Filter::Source, Filter::Time]
+            .into_iter()
+            .find(|f| f.key() == c)
+    }
+}
+
+/// The dropdown opened by clicking a filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Menu {
+    pub filter: Filter,
+    pub options: Vec<String>,
+    pub current: usize,
+    /// Highlighted option (mouse hover or arrow keys).
+    pub hover: usize,
+}
+
+/// Where the last frame drew things, for mouse hits. The view fills it in on every draw.
+#[derive(Debug, Default)]
+pub struct Regions {
+    pub search: Rect,
+    pub list: Rect,
+    /// The split preview pane.
+    pub preview: Rect,
+    /// The peek overlay.
+    pub peek: Rect,
+    pub chips: Vec<(Rect, Filter)>,
+    /// Clickable hints; a click presses the key.
+    pub buttons: Vec<(Rect, KeyCode)>,
+    /// One per menu option.
+    pub menu: Vec<Rect>,
+}
+
+impl Regions {
+    pub fn chip_at(&self, at: Position) -> Option<Filter> {
+        self.chips
+            .iter()
+            .find(|(r, _)| r.contains(at))
+            .map(|&(_, f)| f)
+    }
+
+    pub fn button_at(&self, at: Position) -> Option<KeyCode> {
+        self.buttons
+            .iter()
+            .find(|(r, _)| r.contains(at))
+            .map(|&(_, k)| k)
     }
 }
 
@@ -261,6 +331,12 @@ pub struct App {
     pub tick: usize,
     /// Launched by a shell binding, so `e` can put the command on the prompt.
     pub from_shell: bool,
+    pub menu: Option<Menu>,
+    pub regions: Regions,
+    /// Last known mouse position, for hover highlights.
+    pub mouse: Option<Position>,
+    /// Row and time of the last click, to tell a double click.
+    last_click: Option<(Key, Instant)>,
 }
 
 impl App {
@@ -299,6 +375,10 @@ impl App {
             exit: None,
             tick: 0,
             from_shell,
+            menu: None,
+            regions: Regions::default(),
+            mouse: None,
+            last_click: None,
         };
         app.fetch();
         app
@@ -628,35 +708,95 @@ impl App {
         }
     }
 
-    fn cycle_machine(&mut self) {
-        if self.machines.len() < 2 {
+    /// The choices of a filter and the index of the current one.
+    pub fn filter_options(&self, filter: Filter) -> (Vec<String>, usize) {
+        match filter {
+            Filter::Kinds => (
+                vec!["对话".into(), "全部会话".into()],
+                self.all_kinds as usize,
+            ),
+            Filter::Machine => (
+                std::iter::once("全部机器".to_string())
+                    .chain(self.machines.iter().cloned())
+                    .collect(),
+                self.machine_choice.map_or(0, |i| i + 1),
+            ),
+            Filter::Source => (
+                std::iter::once("全部来源".to_string())
+                    .chain(self.sources_seen.iter().cloned())
+                    .collect(),
+                self.source
+                    .as_ref()
+                    .and_then(|s| self.sources_seen.iter().position(|seen| seen == s))
+                    .map_or(0, |i| i + 1),
+            ),
+            Filter::Time => (
+                Range::CHOICES.iter().map(|r| r.label().into()).collect(),
+                Range::CHOICES
+                    .iter()
+                    .position(|r| *r == self.range)
+                    .unwrap_or(0),
+            ),
+        }
+    }
+
+    fn set_filter(&mut self, filter: Filter, index: usize) {
+        let (options, current) = self.filter_options(filter);
+        if index == current || index >= options.len() {
+            return;
+        }
+        match filter {
+            Filter::Kinds => self.all_kinds = index == 1,
+            Filter::Machine => self.machine_choice = index.checked_sub(1),
+            Filter::Source => {
+                self.source = index
+                    .checked_sub(1)
+                    .and_then(|i| self.sources_seen.get(i).cloned())
+            }
+            Filter::Time => self.range = Range::CHOICES[index],
+        }
+        self.fetch();
+    }
+
+    /// Whether the filter means anything right now; says why not otherwise.
+    fn filter_usable(&mut self, filter: Filter) -> bool {
+        match filter {
+            Filter::Kinds if !self.query.trim().is_empty() => {
+                self.set_status("搜索本来就包含全部会话");
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn cycle(&mut self, filter: Filter) {
+        if filter == Filter::Machine && self.machines.len() < 2 {
             self.set_status("只配置了一台机器");
             return;
         }
-        self.machine_choice = match self.machine_choice {
-            None => Some(0),
-            Some(i) if i + 1 < self.machines.len() => Some(i + 1),
-            Some(_) => None,
-        };
-        self.fetch();
-    }
-
-    fn cycle_source(&mut self) {
-        let options: Vec<Option<String>> = std::iter::once(None)
-            .chain(self.sources_seen.iter().cloned().map(Some))
-            .collect();
-        let at = options.iter().position(|o| *o == self.source).unwrap_or(0);
-        self.source = options[(at + 1) % options.len()].clone();
-        self.fetch();
-    }
-
-    fn toggle_kinds(&mut self) {
-        if !self.query.trim().is_empty() {
-            self.set_status("搜索本来就包含全部会话");
+        if !self.filter_usable(filter) {
             return;
         }
-        self.all_kinds = !self.all_kinds;
-        self.fetch();
+        let (options, current) = self.filter_options(filter);
+        self.set_filter(filter, (current + 1) % options.len());
+    }
+
+    /// Open the dropdown of a filter, or close it if it is already open.
+    fn toggle_menu(&mut self, filter: Filter) {
+        if self.menu.as_ref().is_some_and(|m| m.filter == filter) {
+            self.menu = None;
+            return;
+        }
+        if !self.filter_usable(filter) {
+            return;
+        }
+        let (options, current) = self.filter_options(filter);
+        self.menu = Some(Menu {
+            filter,
+            options,
+            current,
+            hover: current,
+        });
     }
 
     pub fn kinds_label(&self) -> &'static str {
@@ -739,6 +879,19 @@ impl App {
                 self.pending = None;
                 self.status = None;
             }
+            return;
+        }
+        if self.menu.is_some() && self.menu_key(key) {
+            return;
+        }
+        // Alt plus a filter letter works in the search box too, where plain letters type.
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && self.reader.is_none()
+            && !self.peek
+            && let KeyCode::Char(c) = key.code
+            && let Some(filter) = Filter::from_key(c)
+        {
+            self.cycle(filter);
             return;
         }
         if self.reader.is_some() {
@@ -858,13 +1011,11 @@ impl App {
             KeyCode::Char('o') | KeyCode::Char('l') | KeyCode::Right => self.open_reader(),
             KeyCode::Char('J') => self.preview_scroll += 3,
             KeyCode::Char('K') => self.preview_scroll = self.preview_scroll.saturating_sub(3),
-            KeyCode::Char('s') => self.cycle_source(),
-            KeyCode::Char('t') => {
-                self.range = self.range.next();
-                self.fetch();
+            KeyCode::Char(c @ ('s' | 't' | 'm' | 'a')) => {
+                if let Some(filter) = Filter::from_key(c) {
+                    self.cycle(filter);
+                }
             }
-            KeyCode::Char('m') => self.cycle_machine(),
-            KeyCode::Char('a') => self.toggle_kinds(),
             KeyCode::Char('/') | KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Query,
             KeyCode::Char('q') => self.exit = Some(Exit::Quit),
             KeyCode::Backspace => {
@@ -879,6 +1030,30 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Keys while a dropdown is open. Returns false for keys that close it and should still
+    /// do their usual thing.
+    fn menu_key(&mut self, key: KeyEvent) -> bool {
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let last = menu.options.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => menu.hover = menu.hover.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => menu.hover = (menu.hover + 1).min(last),
+            KeyCode::Enter => {
+                let (filter, index) = (menu.filter, menu.hover);
+                self.menu = None;
+                self.set_filter(filter, index);
+            }
+            KeyCode::Esc => self.menu = None,
+            _ => {
+                self.menu = None;
+                return false;
+            }
+        }
+        true
     }
 
     fn peek_key(&mut self, key: KeyEvent) {
@@ -982,42 +1157,110 @@ impl App {
         }
     }
 
-    pub fn on_mouse(&mut self, mouse: MouseEvent, list_top: u16) {
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        let at = Position::new(mouse.column, mouse.row);
+        self.mouse = Some(at);
+        if self.pending.is_some() {
+            return;
+        }
         match mouse.kind {
-            MouseEventKind::ScrollDown => {
-                if let Some(reader) = self.reader.as_mut() {
-                    reader.scroll_by(3);
-                } else if self.peek {
-                    self.preview_scroll += 3;
-                } else {
-                    self.move_selection(1);
+            MouseEventKind::Moved => {
+                if let Some(menu) = self.menu.as_mut()
+                    && let Some(i) = self.regions.menu.iter().position(|r| r.contains(at))
+                {
+                    menu.hover = i;
                 }
             }
-            MouseEventKind::ScrollUp => {
-                if let Some(reader) = self.reader.as_mut() {
-                    reader.scroll_by(-3);
-                } else if self.peek {
-                    self.preview_scroll = self.preview_scroll.saturating_sub(3);
-                } else {
-                    self.move_selection(-1);
-                }
-            }
-            MouseEventKind::Down(_) if self.reader.is_none() && !self.peek => {
-                if mouse.row >= list_top {
-                    let index = self.list_offset + (mouse.row - list_top) as usize;
-                    if index < self.rows.len() {
-                        self.focus = Focus::List;
-                        if index == self.selected {
-                            self.request_command(Purpose::Run);
-                        } else {
-                            self.selected = index;
-                            self.schedule_preview();
-                        }
-                    }
-                }
-            }
+            MouseEventKind::ScrollDown => self.wheel(at, 1),
+            MouseEventKind::ScrollUp => self.wheel(at, -1),
+            MouseEventKind::Down(MouseButton::Left) => self.click(at),
             _ => {}
         }
+    }
+
+    fn wheel(&mut self, at: Position, delta: isize) {
+        if self.menu.is_some() {
+            return;
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            reader.scroll_by(delta * 3);
+        } else if self.peek || self.regions.preview.contains(at) {
+            self.preview_scroll = self.preview_scroll.saturating_add_signed(delta * 3);
+        } else {
+            self.move_selection(delta);
+        }
+    }
+
+    fn click(&mut self, at: Position) {
+        // Hints in the footer and the peek overlay press their key.
+        if let Some(code) = self.regions.button_at(at) {
+            self.menu = None;
+            self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+            return;
+        }
+        if self.reader.is_some() {
+            return;
+        }
+        if let Some(menu) = &self.menu {
+            let filter = menu.filter;
+            match self.regions.menu.iter().position(|r| r.contains(at)) {
+                Some(i) => {
+                    self.menu = None;
+                    self.set_filter(filter, i);
+                }
+                // A click elsewhere only closes the menu, unless it opens another one.
+                None => match self.regions.chip_at(at) {
+                    Some(other) if other != filter => self.toggle_menu(other),
+                    _ => self.menu = None,
+                },
+            }
+            return;
+        }
+        if self.peek {
+            if !self.regions.peek.contains(at) {
+                self.peek = false;
+            }
+            return;
+        }
+        if let Some(filter) = self.regions.chip_at(at) {
+            self.toggle_menu(filter);
+        } else if self.regions.search.contains(at) {
+            self.focus = Focus::Query;
+            self.cursor = self.cursor_at(at.x.saturating_sub(self.regions.search.x + 4));
+        } else if self.regions.list.contains(at) {
+            let index = self.list_offset + (at.y - self.regions.list.y) as usize;
+            let Some(row) = self.rows.get(index) else {
+                return;
+            };
+            self.focus = Focus::List;
+            let double = self
+                .last_click
+                .as_ref()
+                .is_some_and(|(key, when)| *key == row.key && when.elapsed() < DOUBLE_CLICK);
+            if double {
+                self.last_click = None;
+                self.request_command(Purpose::Run);
+            } else {
+                self.last_click = Some((row.key.clone(), Instant::now()));
+                if index != self.selected {
+                    self.selected = index;
+                    self.schedule_preview();
+                }
+            }
+        }
+    }
+
+    /// The cursor position for a click `column` cells into the query text.
+    fn cursor_at(&self, column: u16) -> usize {
+        let mut used = 0usize;
+        for (i, c) in self.query.chars().enumerate() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + w.div_ceil(2) > column as usize {
+                return i;
+            }
+            used += w;
+        }
+        self.query.chars().count()
     }
 
     /// Keep the selection visible in a list of `height` rows.
@@ -1194,6 +1437,64 @@ mod tests {
             command: "claude --resume a".into(),
         });
         assert_eq!(app.exit, Some(Exit::Run("claude --resume a".into())));
+    }
+
+    #[test]
+    fn alt_letters_filter_from_the_search_box() {
+        let mut app = app();
+        let generation = app.generation;
+        app.on_msg(Msg::Rows {
+            generation,
+            outcome: outcome(
+                "local",
+                Reply::Sessions {
+                    sessions: vec![session("a", 10, "claude"), session("b", 5, "codex")],
+                },
+            ),
+        });
+        assert_eq!(app.focus, Focus::Query);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        app.on_key(alt('s'));
+        app.on_key(alt('t'));
+        app.on_key(alt('m'));
+        app.on_key(alt('a'));
+        assert_eq!(app.query, "", "nothing typed");
+        assert_eq!(app.focus, Focus::Query, "still in the search box");
+        assert_eq!(app.source.as_deref(), Some("claude"));
+        assert_eq!(app.range, Range::Day);
+        assert_eq!(app.machine_choice, Some(0));
+        assert!(app.all_kinds);
+        // Plain letters still type.
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.query, "s");
+        app.on_key(alt('a'));
+        assert!(app.all_kinds, "kinds do not apply to a search");
+    }
+
+    #[test]
+    fn menu_keys_choose_and_close() {
+        let mut app = app();
+        app.toggle_menu(Filter::Time);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.options.len(), 5);
+        assert_eq!(menu.current, 0);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.menu.is_none());
+        assert_eq!(app.range, Range::Week);
+        assert!(matches!(&app.take_effects()[..], [Effect::Fetch { .. }]));
+
+        app.toggle_menu(Filter::Time);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.menu.is_none());
+        assert_eq!(app.query, "", "Esc only closed the menu");
+        assert!(app.exit.is_none());
+        // Other keys close the menu and still do their thing.
+        app.toggle_menu(Filter::Time);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.menu.is_none());
+        assert_eq!(app.query, "x");
     }
 
     #[test]
