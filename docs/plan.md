@@ -503,4 +503,4 @@ memex 适配器（`src/backend/memex.rs` 和它的测试）已删除；配置里
 
 - 三张截图换成三个 GIF：shell 里 Alt-M 搜索并恢复、全文阅读、herdr 里 prefix+m 的浮层。每按一次键截一帧，按了什么键画在窗口下方。`scripts/screenshots/record.py` 在独立的 tmux 里驱动真实界面，herdr 那段用假 HOME 里单独的 herdr（只链接本仓库的插件，不碰正在用的 herdr）；`gif.py` 用 Playwright 渲染，ffmpeg 合成，三个一共约 1.3MB。README 同时精简了一半。
 - 录的时候发现 **zsh 的 Alt-M 打开界面后收不到任何按键**：zsh 的 widget 里标准输入是 `/dev/null`，crossterm 退而打开 `/dev/tty`，macOS 的 kqueue 监听不了它。crossterm 打开 `use-dev-tty` 特性（改用 poll）后正常。fish 不受影响。
-
+- 做视频时发现 **herdr 里新开 tab 恢复会话，命令会显示两遍**：tab 刚建好、shell 还没画出提示符时就 `pane run`，终端先原样回显，shell 再显示一遍（fish 下也能复现）。现在先读 pane，等屏幕有内容并稳定 150ms 再敲，最多等 3 秒。

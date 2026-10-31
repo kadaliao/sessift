@@ -108,4 +108,5 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - **record_id 只在本机有效**：里面编的是本机索引的内部会话号，`context` 请求要带 `session_id`，服务端会核对。
 - **zsh 的快捷键 widget 里标准输入是 `/dev/null`**，crossterm 只能打开 `/dev/tty`，而 macOS 的 kqueue 监听不了它，界面能画出来但收不到按键。所以 crossterm 开了 `use-dev-tty` 特性（改用 poll）。fish 的 `(…)` 继承真正的终端，不受影响。
 - **tmux 的 `new-session -e PATH=…` 不一定生效**：录 GIF 的 shell 在自己的 rc 里设 PATH，tmux 服务器用干净的环境启动（也避免继承 `HERDR_*` 连到真实的 herdr）。
+- **herdr 新开 tab 后不能马上 `pane run`**：shell 还没进入行编辑时，敲进去的字会先被终端原样回显一遍，提示符出来后 shell 又显示一遍。`herdr.rs` 先读 pane 等屏幕出现内容、稳定 150ms（最多 3 秒）再敲。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。

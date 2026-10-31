@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -22,12 +23,18 @@ const SHELLS: &[&str] = &[
 /// Tab labels are cut to this many columns.
 const LABEL_WIDTH: usize = 24;
 
+/// How long a new tab's shell may take to draw its prompt before the command is typed anyway.
+const PROMPT_WAIT: Duration = Duration::from_secs(3);
+/// A screen unchanged this long counts as a drawn prompt.
+const PROMPT_SETTLE: Duration = Duration::from_millis(150);
+
 pub struct Herdr {
     bin: String,
     workspace: Option<String>,
     /// The tiled pane the popup was opened over.
     origin: Option<String>,
     copier: fn(&str) -> Result<()>,
+    prompt_wait: Duration,
 }
 
 /// Where the session ended up.
@@ -57,6 +64,7 @@ impl Herdr {
             workspace: field("workspace_id").or_else(|| env("HERDR_WORKSPACE_ID")),
             origin: field("focused_pane_id").or_else(|| env("HERDR_PANE_ID")),
             copier: pick::copy,
+            prompt_wait: PROMPT_WAIT,
         }
     }
 
@@ -91,6 +99,7 @@ impl Herdr {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("herdr tab create returned no pane"))?
             .to_string();
+        self.wait_for_prompt(&pane);
         self.call(&["pane", "run", &pane, &chosen.command])?;
         Ok(Outcome::NewTab(pane))
     }
@@ -154,6 +163,40 @@ impl Herdr {
                     .is_some_and(|name| SHELLS.contains(&name.trim_start_matches('-')))
         });
         is_shell.then(|| origin.to_string())
+    }
+
+    /// Wait for a new pane's shell to draw its prompt. Typed before that, the command is echoed
+    /// by the terminal and then shown a second time by the shell's line editor.
+    fn wait_for_prompt(&self, pane: &str) {
+        let deadline = Instant::now() + self.prompt_wait;
+        let mut seen: Option<(String, Instant)> = None;
+        while Instant::now() < deadline {
+            let screen = self.screen(pane).unwrap_or_default();
+            if !screen.trim().is_empty() {
+                match &seen {
+                    Some((last, since)) if *last == screen => {
+                        if since.elapsed() >= PROMPT_SETTLE {
+                            return;
+                        }
+                    }
+                    _ => seen = Some((screen, Instant::now())),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    /// The visible text of a pane (`herdr pane read` prints plain text, not JSON).
+    fn screen(&self, pane: &str) -> Result<String> {
+        let output = Command::new(&self.bin)
+            .args(["pane", "read", pane, "--source", "visible"])
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("run {} pane read", self.bin))?;
+        if !output.status.success() {
+            bail!("herdr pane read failed");
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn notify(&self, title: &str, body: Option<&str>) {
@@ -241,6 +284,7 @@ fi
 case "$1 $2" in
   "pane list") cat "$dir/panes.json" ;;
   "pane process-info") cat "$dir/proc.json" ;;
+  "pane read") cat "$dir/screen.txt" 2>/dev/null ;;
   "tab create") echo '{"result":{"root_pane":{"pane_id":"w1:p9"},"tab":{"tab_id":"w1:t9"}}}' ;;
   *) echo '{"result":{"type":"ok"}}' ;;
 esac
@@ -249,6 +293,7 @@ esac
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let fake = Self { dir };
+            fake.screen("~/work ❯ ");
             fake.panes(&[]);
             fake.foreground("fish", true);
             fake
@@ -260,7 +305,22 @@ esac
                 workspace: Some("w1".into()),
                 origin: Some("w1:p1".into()),
                 copier: |_| Ok(()),
+                prompt_wait: Duration::from_millis(600),
             }
+        }
+
+        /// What `pane read` shows; empty means the shell has drawn nothing yet.
+        fn screen(&self, text: &str) {
+            std::fs::write(self.dir.path().join("screen.txt"), text).unwrap();
+        }
+
+        /// Every call, lookups included.
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
         }
 
         /// Panes as (pane id, agent session id).
@@ -299,7 +359,11 @@ esac
             std::fs::read_to_string(self.dir.path().join("calls"))
                 .unwrap_or_default()
                 .lines()
-                .filter(|l| !l.starts_with("pane|list|") && !l.starts_with("pane|process-info|"))
+                .filter(|l| {
+                    !l.starts_with("pane|list|")
+                        && !l.starts_with("pane|process-info|")
+                        && !l.starts_with("pane|read|")
+                })
                 .map(str::to_string)
                 .collect()
         }
@@ -363,6 +427,36 @@ esac
                 "tab|create|--label|修复 登录 超时|--focus|--workspace|w1|--cwd|/tmp|",
                 "pane|run|w1:p9|cd /tmp && claude --resume s1|",
             ]
+        );
+    }
+
+    #[test]
+    fn a_new_tab_gets_the_command_once_its_prompt_is_up() {
+        let fake = Fake::new();
+        fake.foreground("claude", false);
+        fake.herdr().resume(&chosen(LOCAL)).unwrap();
+        let calls = fake.calls();
+        let at = |prefix: &str| calls.iter().position(|c| c.starts_with(prefix)).unwrap();
+        assert!(at("tab|create|") < at("pane|read|w1:p9|"));
+        assert!(at("pane|read|w1:p9|") < at("pane|run|w1:p9|"));
+    }
+
+    #[test]
+    fn a_shell_that_draws_nothing_still_gets_the_command() {
+        let fake = Fake::new();
+        fake.foreground("claude", false);
+        fake.screen("");
+        let started = Instant::now();
+        let outcome = fake.herdr().resume(&chosen(LOCAL)).unwrap();
+        assert_eq!(outcome, Outcome::NewTab("w1:p9".into()));
+        assert!(
+            started.elapsed() >= Duration::from_millis(600),
+            "waited for a prompt"
+        );
+        assert!(
+            fake.actions()
+                .iter()
+                .any(|a| a.starts_with("pane|run|w1:p9|"))
         );
     }
 
