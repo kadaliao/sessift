@@ -482,6 +482,23 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     app.preview_scroll = scroll;
 }
 
+/// Clear `rect` for an overlay. A wide character just left of it would still be drawn across
+/// the overlay's first column, and the terminal backend skips the column a wide character
+/// covers, so the left border went missing there. Herdr's popups have the same problem.
+fn clear_overlay(frame: &mut Frame, rect: Rect) {
+    frame.render_widget(Clear, rect);
+    let buf = frame.buffer_mut();
+    if rect.x <= buf.area.x {
+        return;
+    }
+    for y in rect.top()..rect.bottom().min(buf.area.bottom()) {
+        let cell = &mut buf[(rect.x - 1, y)];
+        if cell.symbol().width() > 1 {
+            cell.set_symbol(" ");
+        }
+    }
+}
+
 fn draw_peek(frame: &mut Frame, area: Rect, app: &mut App) {
     let width = (area.width as f32 * 0.9) as u16;
     let height = (area.height as f32 * 0.85) as u16;
@@ -494,7 +511,7 @@ fn draw_peek(frame: &mut Frame, area: Rect, app: &mut App) {
     app.regions.peek = rect;
     // The footer underneath does not apply while peeking.
     app.regions.buttons.clear();
-    frame.render_widget(Clear, rect);
+    clear_overlay(frame, rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -655,7 +672,7 @@ fn draw_menu(frame: &mut Frame, area: Rect, app: &mut App) {
         height,
     }
     .intersection(area);
-    frame.render_widget(Clear, rect);
+    clear_overlay(frame, rect);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -954,6 +971,29 @@ mod tests {
 
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn an_overlay_keeps_its_left_border_over_wide_characters() {
+        // Frame one: a line of wide characters; frame two: an overlay whose left edge falls in
+        // the middle of one. Only what the backend is sent ends up in its buffer.
+        let mut terminal = Terminal::new(TestBackend::new(12, 4)).unwrap();
+        let line = "中文中文中文";
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(line), f.area()))
+            .unwrap();
+        let rect = Rect::new(3, 0, 6, 3);
+        terminal
+            .draw(|f| {
+                f.render_widget(Paragraph::new(line), f.area());
+                clear_overlay(f, rect);
+                f.render_widget(Block::default().borders(Borders::ALL), rect);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(3, 0)].symbol(), "┌");
+        assert_eq!(buf[(3, 1)].symbol(), "│");
+        assert_eq!(buf[(2, 0)].symbol(), " ", "the cut character gives way");
+    }
 
     fn sessions_app(ids: &[(&str, &str)]) -> App {
         let mut app = App::new(vec!["local".into(), "mm".into()], String::new(), true);

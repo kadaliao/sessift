@@ -1,6 +1,6 @@
 id = "sessift"
 name = "sessift"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "Search and resume AI coding sessions (Claude Code, Codex, Pi, OpenCode, Grok) on this machine and others."
 platforms = ["macos", "linux"]
@@ -20,6 +20,9 @@ command = ["sh", "open.sh"]
 id = "picker"
 title = "sessift"
 placement = "popup"
-width = "90%"
+# Full width: the left border then sits next to the sidebar's narrow separator. Narrower, it can
+# land on the right half of a wide character in the pane underneath, and herdr (0.9.5) then
+# drops that border cell.
+width = "100%"
 height = "90%"
 command = ["sh", "picker.sh"]
