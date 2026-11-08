@@ -13,6 +13,7 @@
 - 2026-10-31 v0.3.0：agent skill（`sessift skill install`，本机已装）；agent 里运行时自动排除当前会话；`read --around`、`--tail`、`--tool-chars`；jsonl 时间改成带时区的本地时间。三个子 agent 试用过，见 `docs/plan.md` 的"阶段 5"。服务端也改了（`tool_chars`、`context` 的核对和 `next_offset`），mm 已同步更新。
 - 2026-10-31 v0.3.1：修复 zsh 快捷键打开界面后收不到按键（crossterm `use-dev-tty`）；README 改用带按键的 GIF（`scripts/screenshots/run.sh` 生成）。mm 上 brew 装的 sessift 和远端服务都已更新，mm 也装了 skill、herdr 插件，配置里能查本机（本机 `~/.sessift/bin/sessift` 链接到 `~/.local/bin/sessift`）。
 - 2026-10-31 v0.3.2：herdr 新开 tab 恢复时等提示符出来再敲命令（原来命令显示两遍）；浮层左边框压在中文上不再消失（sessift 的 `clear_overlay`，herdr 插件 0.1.1 浮层改成 100% 宽）。
+- 2026-11-08 v0.3.3：远端是 macOS 时，恢复 Claude 会话前先检查钥匙串，SSH 会话里读不到就提示输入密码解锁（原来 Claude 直接要求 /login）；README 写了用 `claude setup-token` 免输密码的办法。只改了客户端。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 
@@ -111,4 +112,5 @@ scripts/eval.py --sessift target/release/sessift --compare defaults   # 搜索�
 - **tmux 的 `new-session -e PATH=…` 不一定生效**：录 GIF 的 shell 在自己的 rc 里设 PATH，tmux 服务器用干净的环境启动（也避免继承 `HERDR_*` 连到真实的 herdr）。
 - **herdr 新开 tab 后不能马上 `pane run`**：shell 还没进入行编辑时，敲进去的字会先被终端原样回显一遍，提示符出来后 shell 又显示一遍。`herdr.rs` 先读 pane 等屏幕出现内容、稳定 150ms（最多 3 秒）再敲。
 - **浮层的左边框压在双宽字上会消失**：ratatui 输出差异时，一个双宽字后面那一格直接跳过，浮层左边一格的中文跨进来，就把边框那一格吃掉了。sessift 的浮层用 `view.rs` 的 `clear_overlay`（把跨进来的字换成空格）；herdr 0.9.5 的 popup 有同样的问题，插件把浮层宽度设成 100%，让左边框挨着侧栏的单宽分隔线。
+- **macOS 上 SSH 会话里的钥匙串是锁着的**：哪怕屏幕前已经登录，SSH 会话读钥匙串也返回 36（errSecInteractionNotAllowed），Claude 读不到 `Claude Code-credentials`，会要求 /login（`claude auth status` 显示 `"loggedIn": false`）。`security unlock-keychain` 只对当前这条 SSH 连接有效，新连接又是锁着的。Claude 用 `security find-generic-password` 命令读钥匙串，所以同一会话里先解锁就行。`pick.rs` 的 `CLAUDE_UNLOCK` 在远端恢复前检查并提示解锁，设了 `CLAUDE_CODE_OAUTH_TOKEN` 就跳过；条目存在但锁着时，不带 `-w` 的查询照样成功，只有读值才会失败。
 - **超时不等于连接死了**：慢链路上大响应本来就可能超时。broker 只在后台探测确认不通之后才换连接，否则重连会越来越慢。

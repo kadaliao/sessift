@@ -146,11 +146,28 @@ pub fn build_resume(
     match transport {
         // The remote login shell runs the command as given, so it stays one word here.
         Some(TransportSpec::Ssh { target: host, .. }) => {
-            format!("ssh -t {} {}", quote(host, shell), quote(&resume, shell))
+            let remote = match summary.map(|s| s.source.as_str()) {
+                Some("claude") => format!("sh -c '{CLAUDE_UNLOCK}'; {resume}"),
+                _ => resume,
+            };
+            format!("ssh -t {} {}", quote(host, shell), quote(&remote, shell))
         }
         _ => read(),
     }
 }
+
+/// Runs on the remote before `claude --resume`. macOS keeps Claude's login in the login
+/// keychain, which stays locked in an SSH session even while the owner is logged in at the
+/// screen, so Claude would ask to /login. When reading it fails with errSecInteractionNotAllowed
+/// (36), say why and unlock it with the login password. A `CLAUDE_CODE_OAUTH_TOKEN` (from
+/// `claude setup-token`) means no keychain; elsewhere `security` is missing or succeeds.
+/// POSIX sh with no single quotes, so `sh -c '…'` survives a fish or POSIX login shell.
+const CLAUDE_UNLOCK: &str = concat!(
+    r#"[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || security find-generic-password"#,
+    r#" -s "Claude Code-credentials" -w >/dev/null 2>&1; [ $? = 36 ] && echo"#,
+    r#" "sessift: SSH 会话里钥匙串是锁着的，Claude 读不到登录信息。输入这台机器的登录密码解锁"#,
+    r#"（不想每次输入：claude setup-token，见 sessift 的 README）" >&2 && security unlock-keychain"#,
+);
 
 /// Copy to the clipboard: a native tool when there is one, else an OSC 52 escape.
 pub fn copy(value: &str) -> Result<()> {
@@ -356,41 +373,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resume_commands() {
-        let resume = "cd '/w/my proj' && claude --resume abc";
-        let ssh = TransportSpec::Ssh {
+    fn ssh() -> TransportSpec {
+        TransportSpec::Ssh {
             target: "mm".into(),
             remote_command: "x".into(),
             options: vec![],
+        }
+    }
+
+    #[test]
+    fn resume_commands() {
+        let resume = "cd '/w/my proj' && opencode --session abc";
+        let ssh = ssh();
+        let opencode = SessionSummary {
+            source: "opencode".into(),
+            resume_cmd: Some(resume.into()),
+            ..summary(None)
         };
         assert_eq!(
-            build_resume(
-                &target("local"),
-                Some(&summary(Some(resume))),
-                None,
-                ShellKind::Fish
-            ),
+            build_resume(&target("local"), Some(&opencode), None, ShellKind::Fish),
             resume
         );
         assert_eq!(
-            build_resume(
-                &target("mm"),
-                Some(&summary(Some(resume))),
-                Some(&ssh),
-                ShellKind::Fish
-            ),
-            r"ssh -t mm 'cd \'/w/my proj\' && claude --resume abc'"
+            build_resume(&target("mm"), Some(&opencode), Some(&ssh), ShellKind::Fish),
+            r"ssh -t mm 'cd \'/w/my proj\' && opencode --session abc'"
         );
         assert_eq!(
-            build_resume(
-                &target("mm"),
-                Some(&summary(Some(resume))),
-                Some(&ssh),
-                ShellKind::Zsh
-            ),
-            r"ssh -t mm 'cd '\''/w/my proj'\'' && claude --resume abc'"
+            build_resume(&target("mm"), Some(&opencode), Some(&ssh), ShellKind::Zsh),
+            r"ssh -t mm 'cd '\''/w/my proj'\'' && opencode --session abc'"
         );
+        // Claude over SSH unlocks the remote keychain first; locally it runs as given.
+        let claude = "cd /w && claude --resume abc";
+        assert_eq!(
+            build_resume(
+                &target("local"),
+                Some(&summary(Some(claude))),
+                None,
+                ShellKind::Fish
+            ),
+            claude
+        );
+        let remote = build_resume(
+            &target("mm"),
+            Some(&summary(Some(claude))),
+            Some(&ssh),
+            ShellKind::Zsh,
+        );
+        assert!(remote.starts_with(r"ssh -t mm 'sh -c '\''[ -n "));
+        assert!(remote.ends_with(r"'\''; cd /w && claude --resume abc'"));
         assert_eq!(
             build_resume(
                 &target("mm"),
@@ -404,6 +434,134 @@ mod tests {
             build_resume(&target("local"), None, None, ShellKind::Bash),
             "sessift read abc -m local --path /p/abc.jsonl"
         );
+    }
+
+    #[cfg(unix)]
+    fn fish() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("fish"))
+            .find(|p| p.is_file())
+    }
+
+    /// Runs the Claude resume command through a local shell, a stand-in `ssh` and a remote
+    /// shell (`sh` or `fish`), with stand-in `security` and `claude`. The stand-ins are written
+    /// once: macOS checks every new executable on its first run, which costs ~0.6s each.
+    #[cfg(unix)]
+    struct Remote {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl Remote {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let script = |sub: &str, name: &str, body: &str| {
+                let path = dir.path().join(sub).join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            script(
+                "bin",
+                "ssh",
+                r#"[ "$1 $2" = "-t mm" ] || exit 9; exec $REMOTE -c "$3""#,
+            );
+            script("bin", "claude", r#"echo "claude $*" >> "$LOG""#);
+            script(
+                "kc",
+                "security",
+                r#"echo "security $1" >> "$LOG"; [ "$1" = unlock-keychain ] || exit $KEYCHAIN"#,
+            );
+            Self { dir }
+        }
+
+        /// The calls logged and stderr. `keychain` is what reading it exits with, `None`
+        /// leaves `security` off PATH (which never holds the real one).
+        fn run(
+            &self,
+            local: ShellKind,
+            remote: &str,
+            keychain: Option<i32>,
+            token: bool,
+        ) -> (String, String) {
+            let root = self.dir.path();
+            let log = root.join("log");
+            let _ = std::fs::remove_file(&log);
+            let shell = |name: &str| match name {
+                "fish" => format!("{} --no-config", fish().unwrap().display()),
+                _ => "/bin/sh".to_string(),
+            };
+            let resume = format!("cd {} && claude --resume abc", root.display());
+            let command = build_resume(
+                &target("mm"),
+                Some(&summary(Some(&resume))),
+                Some(&ssh()),
+                local,
+            );
+            let mut path = format!("{}:/bin", root.join("bin").display());
+            if keychain.is_some() {
+                path = format!("{}:{path}", root.join("kc").display());
+            }
+            let local_shell = shell(if local == ShellKind::Fish {
+                "fish"
+            } else {
+                "sh"
+            });
+            let mut words = local_shell.split(' ');
+            let mut cmd = std::process::Command::new(words.next().unwrap());
+            cmd.args(words)
+                .args(["-c", &command])
+                .env("PATH", path)
+                .env("REMOTE", shell(remote))
+                .env("LOG", &log)
+                .env("KEYCHAIN", keychain.unwrap_or(0).to_string())
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+            if token {
+                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "t");
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{command}: {out:?}");
+            (
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_resume_unlocks_a_locked_keychain() {
+        let remote = Remote::new();
+        // Local shell quoting × remote login shell; fish only where it is installed.
+        let mut layers = vec![(ShellKind::Sh, "sh")];
+        if fish().is_some() {
+            layers.extend([
+                (ShellKind::Fish, "fish"),
+                (ShellKind::Zsh, "fish"),
+                (ShellKind::Fish, "sh"),
+            ]);
+        }
+        let find = "security find-generic-password\n";
+        for (local, shell) in layers {
+            let (log, err) = remote.run(local, shell, Some(36), false);
+            assert_eq!(
+                log,
+                format!("{find}security unlock-keychain\nclaude --resume abc\n")
+            );
+            assert!(err.contains("claude setup-token"), "{err}");
+            // Readable, a token, or no keychain at all: straight to claude.
+            for (keychain, token, calls) in [
+                (Some(0), false, find),
+                (Some(36), true, ""),
+                (None, false, ""),
+            ] {
+                let (log, err) = remote.run(local, shell, keychain, token);
+                assert_eq!(log, format!("{calls}claude --resume abc\n"));
+                assert_eq!(err, "");
+            }
+        }
     }
 
     #[test]

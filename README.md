@@ -113,6 +113,27 @@ kind = "native"
 
 </details>
 
+### 远端是 Mac 时恢复 Claude 会话
+
+Claude Code 在 macOS 上把登录信息存在钥匙串里。通过 SSH 登录时钥匙串是锁着的（哪怕那台机器的屏幕前已经登录），Claude 读不到，就会让你 `/login`。所以恢复远端的 Claude 会话时，sessift 先检查一下，读不到就提示输入那台机器的登录密码解锁。解锁只对这一条 SSH 连接有效，下次恢复还要输入。
+
+不想每次输入密码，就在远端生成一个长期令牌，只给 SSH 会话用：
+
+```sh
+ssh -t devbox claude setup-token    # 按提示在浏览器里授权，最后打印出令牌
+```
+
+把令牌加到远端的 shell 配置里，要放在非交互的 shell 也会读的地方（zsh 的 `~/.zshenv`；fish 的 `config.fish`，写在 `status is-interactive` 判断之外）：
+
+```sh
+# zsh / bash
+[ -n "$SSH_CONNECTION" ] && export CLAUDE_CODE_OAUTH_TOKEN=<令牌>
+# fish
+set -q SSH_CONNECTION; and set -gx CLAUDE_CODE_OAUTH_TOKEN <令牌>
+```
+
+远端有了这个变量，sessift 就不再提示解锁；那台机器屏幕前的 Claude 照旧用钥匙串里的登录。
+
 ## 给 agent 用
 
 ```sh
