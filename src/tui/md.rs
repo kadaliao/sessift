@@ -33,7 +33,7 @@ impl Para {
 }
 
 /// Split `segment` into spans, marking every occurrence of a query term.
-fn highlighted(segment: &str, style: Style, terms: &[String]) -> Vec<Span<'static>> {
+pub fn highlighted(segment: &str, style: Style, terms: &[String]) -> Vec<Span<'static>> {
     if terms.is_empty() || segment.is_empty() {
         return vec![Span::styled(segment.to_string(), style)];
     }
@@ -259,6 +259,7 @@ pub fn record(rec: &RecordView, opts: &RecordOpts) -> Vec<Para> {
             theme::TOOL,
         ),
         "tool_result" => ("↳ 结果".to_string(), theme::MUTED),
+        "summary" => ("◆ 回顾".to_string(), theme::ACCENT),
         _ => return Vec::new(),
     };
     let mut header = Vec::new();
@@ -275,7 +276,7 @@ pub fn record(rec: &RecordView, opts: &RecordOpts) -> Vec<Para> {
     ));
     let mut out = vec![Para::new(header)];
     let body = match rec.role.as_str() {
-        "user" | "assistant" => {
+        "user" | "assistant" | "summary" => {
             let mut paras = markdown(&rec.text, Style::default(), opts.terms);
             let limit = if opts.compact { 30 } else { usize::MAX };
             if paras.len() > limit {

@@ -165,11 +165,14 @@ pub fn refresh(paths: &IndexPaths, roots: &Roots, opts: &Options) -> Result<Opti
         true
     });
 
+    let names = pending_names(&store, roots)?;
+
     // Nothing to parse; still go on for the first build (even an empty one: queries need
     // `refreshed_ms`) and, outside a query, for merges left by queries.
     let nothing_new = jobs.is_empty()
         && removed.is_empty()
         && moves.is_empty()
+        && names.is_empty()
         && store.meta("refreshed_ms")?.is_some();
     if nothing_new && opts.in_query {
         report.took = started.elapsed();
@@ -204,6 +207,20 @@ pub fn refresh(paths: &IndexPaths, roots: &Roots, opts: &Options) -> Result<Opti
     };
     store.begin()?;
     let result = (|| -> Result<()> {
+        // Before the transcripts, so sessions parsed in this run get their names too.
+        for file in &names {
+            match read_names(file) {
+                Ok((names, done)) => {
+                    for (session_id, title) in &names {
+                        store.put_name(Kind::Codex.name(), session_id, title)?;
+                    }
+                    store.set_meta(&file.key, &format!("{}:{done}:{}", file.inode, file.size))?;
+                }
+                Err(err) => report
+                    .failures
+                    .push((file.path.display().to_string(), format!("{err:#}"))),
+            }
+        }
         for (old, new) in &moves {
             store.move_file(
                 old.id,
@@ -381,6 +398,56 @@ fn plan_existing(f: &Found, row: &FileRow, store: &Store) -> Option<Plan> {
         from: row.parsed,
         state: saved.unwrap_or_default(),
     })
+}
+
+/// A file of session names kept beside the transcripts (Codex's `session_index.jsonl`) that
+/// changed since the last run. It only grows, so reading resumes where the last run stopped.
+struct NameFile {
+    path: PathBuf,
+    /// `meta` key holding `<inode>:<bytes read>:<size>`.
+    key: String,
+    inode: u64,
+    size: u64,
+    from: u64,
+}
+
+fn pending_names(store: &Store, roots: &Roots) -> Result<Vec<NameFile>> {
+    let mut out = Vec::new();
+    for home in &roots.codex {
+        let path = source::codex::names_path(home);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let key = format!("names:{}", path.display());
+        let saved: Option<(u64, u64, u64)> = store.meta(&key)?.and_then(|v| {
+            let mut parts = v.split(':').map(|p| p.parse::<u64>().ok());
+            Some((parts.next()??, parts.next()??, parts.next()??))
+        });
+        let (inode, size) = (meta.ino(), meta.len());
+        let from = match saved {
+            Some((i, _, s)) if i == inode && s == size => continue,
+            Some((i, done, _)) if i == inode && done <= size => done,
+            _ => 0,
+        };
+        out.push(NameFile {
+            path,
+            key,
+            inode,
+            size,
+            from,
+        });
+    }
+    Ok(out)
+}
+
+/// The names added since the last run, and how far the file has now been read.
+fn read_names(file: &NameFile) -> Result<(Vec<(String, String)>, u64)> {
+    let mut bytes = vec![0u8; (file.size - file.from) as usize];
+    File::open(&file.path)
+        .and_then(|f| f.read_exact_at(&mut bytes, file.from))
+        .with_context(|| format!("read {}", file.path.display()))?;
+    let (names, used) = source::codex::parse_names(&bytes);
+    Ok((names, file.from + used as u64))
 }
 
 /// A fingerprint of the bytes just before `end`, to notice in-place rewrites.

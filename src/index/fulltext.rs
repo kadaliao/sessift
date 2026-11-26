@@ -482,6 +482,7 @@ pub fn role_weight(role: u8) -> f32 {
         0 => 1.2, // user
         1 => 1.0, // assistant
         2 => 0.6, // tool_use
+        4 => 1.0, // summary
         _ => 0.4, // tool_result
     }
 }

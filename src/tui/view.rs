@@ -9,8 +9,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Filter, Focus, MachineState, PreviewState, Range, Regions, Row};
+use super::load::Preview;
 use super::md::{self, Para, RecordOpts};
 use super::theme;
+use crate::model::RecordView;
 use crate::text::{self, display_width, fit_width};
 use crate::timefmt::now_ms;
 
@@ -310,19 +312,39 @@ fn row_line(app: &App, row: &Row, width: usize, selected: bool, terms: &[String]
     spans.push(Span::raw(middle(&project, project_w)));
     spans.push(Span::raw("  "));
     used += project_w + 2;
-    let rest = width.saturating_sub(used);
-    let body = fit_width(&text::sanitize_line(&row.text), rest);
+    let mut rest = width.saturating_sub(used);
     let body_style = if selected {
         theme::bold()
     } else {
         Style::default()
     };
     if app.matches_mode {
-        let paras = md::markdown(&body, body_style, terms);
-        if let Some(first) = paras.into_iter().next() {
-            spans.extend(first.spans);
+        // The session's title first, so a hit is easy to place; then what matched, dimmer.
+        // Too narrow for both (beside the preview, which shows the hit), only the title.
+        let title = text::sanitize_line(&row.title);
+        let snippet_style = if text::title_in_snippet(&row.title, &row.text) {
+            body_style
+        } else if rest < 48 {
+            spans.extend(md::highlighted(&fit_width(&title, rest), body_style, terms));
+            rest = 0;
+            body_style
+        } else {
+            let title_w = display_width(&title).min(rest * 2 / 5);
+            let title = fit_width(&title, title_w);
+            spans.extend(md::highlighted(&title, body_style, terms));
+            spans.push(Span::styled("  ", body_style));
+            rest = rest.saturating_sub(title_w + 2);
+            theme::muted()
+        };
+        if rest > 0 {
+            let body = fit_width(&text::sanitize_line(&row.text), rest);
+            let paras = md::markdown(&body, snippet_style, terms);
+            if let Some(first) = paras.into_iter().next() {
+                spans.extend(first.spans);
+            }
         }
     } else {
+        let body = fit_width(&text::sanitize_line(&row.text), rest);
         spans.push(Span::styled(body, body_style));
     }
     if let Some(n) = row.message_count {
@@ -380,12 +402,53 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// A session's title, or a muted placeholder.
+fn title_span(title: &str, style: Style) -> Span<'static> {
+    if title.trim().is_empty() {
+        Span::styled("（无标题）", theme::muted())
+    } else {
+        Span::styled(text::sanitize_line(title), style)
+    }
+}
+
+/// What a preview shows, in display order: records, and how many were left out between them.
+enum Shown<'a> {
+    Record(&'a RecordView),
+    Gap(u32),
+}
+
+fn preview_items(preview: &Preview, newest_first: bool) -> Vec<Shown<'_>> {
+    let mut items = Vec::new();
+    let mut at = 0;
+    for part in &preview.parts {
+        if part.offset > at {
+            items.push(Shown::Gap(part.offset - at));
+        }
+        items.extend(part.records.iter().map(Shown::Record));
+        at = part.end();
+    }
+    if let Some(total) = preview.total
+        && total > at
+    {
+        items.push(Shown::Gap(total - at));
+    }
+    if newest_first {
+        items.reverse();
+    }
+    items
+}
+
 /// The preview of the selected row, laid out for `width` columns.
 fn preview_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let Some(row) = app.selected_row() else {
         return Vec::new();
     };
-    let mut lines = vec![
+    let mut lines = md::wrap(
+        &[Para::new(vec![title_span(&row.title, theme::bold())])],
+        width,
+        0,
+    );
+    lines.extend([
         Line::from(vec![
             Span::styled(
                 if row.project.is_empty() {
@@ -393,26 +456,35 @@ fn preview_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 } else {
                     text::sanitize_line(&row.project)
                 },
-                theme::bold(),
+                theme::muted(),
             ),
             Span::raw("  "),
             Span::styled("● ", Style::default().fg(theme::source_color(&row.source))),
             Span::styled(text::sanitize_line(&row.source), theme::muted()),
             Span::styled(format!("  {}", row.key.machine), theme::faint()),
         ]),
-        Line::from(Span::styled(
-            format!(
-                "{}  ·  {}{}",
-                text::sanitize_line(&row.key.session_id),
-                age(row.ts_ms),
-                row.message_count
-                    .map(|n| format!("  ·  {n} 条"))
-                    .unwrap_or_default()
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}{}  ·  ",
+                    age(row.ts_ms),
+                    row.message_count
+                        .map(|n| format!("  ·  {n} 条"))
+                        .unwrap_or_default()
+                ),
+                theme::faint(),
             ),
-            theme::faint(),
-        )),
+            Span::styled(app.order_label(), theme::muted()),
+            Span::styled(
+                format!(
+                    "（O 切换）  ·  {}",
+                    text::sanitize_line(&row.key.session_id)
+                ),
+                theme::faint(),
+            ),
+        ]),
         Line::styled("─".repeat(width.min(200)), theme::faint()),
-    ];
+    ]);
     let key = app.preview_key();
     match key.as_ref().and_then(|k| app.previews.get(k)) {
         None | Some(PreviewState::Loading) => lines.push(Line::from(vec![
@@ -426,28 +498,30 @@ fn preview_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         Some(PreviewState::Ready(preview)) => {
             let terms = app.terms();
             let mut paras: Vec<Para> = Vec::new();
-            for (i, record) in preview.records.iter().enumerate() {
-                if let Some((at, omitted)) = preview.gap
-                    && at == i
-                {
-                    paras.push(Para::new(vec![Span::styled(
-                        format!("    ··· 省略 {omitted} 条 ···"),
-                        theme::faint(),
-                    )]));
-                    paras.push(Para::blank());
+            for item in preview_items(preview, app.newest_first) {
+                match item {
+                    Shown::Gap(omitted) => {
+                        paras.push(Para::new(vec![Span::styled(
+                            format!("    ··· 省略 {omitted} 条 ···"),
+                            theme::faint(),
+                        )]));
+                        paras.push(Para::blank());
+                    }
+                    Shown::Record(record) => {
+                        let anchor = row.record_id.as_deref() == Some(record.record_id.as_str());
+                        paras.extend(md::record(
+                            record,
+                            &RecordOpts {
+                                compact: true,
+                                expand_tools: false,
+                                anchor,
+                                terms: &terms,
+                            },
+                        ));
+                    }
                 }
-                let anchor = row.record_id.as_deref() == Some(record.record_id.as_str());
-                paras.extend(md::record(
-                    record,
-                    &RecordOpts {
-                        compact: true,
-                        expand_tools: false,
-                        anchor,
-                        terms: &terms,
-                    },
-                ));
             }
-            if paras.is_empty() {
+            if !preview.parts.iter().any(|p| !p.records.is_empty()) {
                 paras.push(Para::new(vec![Span::styled(
                     "（没有可显示的消息）",
                     theme::muted(),
@@ -538,6 +612,7 @@ fn draw_peek(frame: &mut Frame, area: Rect, app: &mut App) {
                 ("Enter", "恢复", Some(KeyCode::Enter)),
                 ("o", "全文", Some(KeyCode::Char('o'))),
                 ("j/k", "滚动", None),
+                ("O", "切换顺序", Some(KeyCode::Char('O'))),
                 ("n", "下一条", Some(KeyCode::Char('n'))),
                 ("p", "上一条", Some(KeyCode::Char('p'))),
                 ("Esc", "关闭", Some(KeyCode::Esc)),
@@ -627,17 +702,23 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App) {
             ("Tab", "分栏预览", Some(KeyCode::Tab)),
             ("Esc", "清空/退出", Some(KeyCode::Esc)),
         ],
-        Focus::List => vec![
-            ("Enter/r", "恢复", Some(KeyCode::Enter)),
-            ("e", edit, Some(KeyCode::Char('e'))),
-            ("Space", "速览", Some(KeyCode::Char(' '))),
-            ("Tab", "分栏", Some(KeyCode::Tab)),
-            ("o", "全文", Some(KeyCode::Char('o'))),
-            ("y/Y", "复制ID/命令", None),
-            (filters, "筛选", None),
-            ("/", "搜索", Some(KeyCode::Char('/'))),
-            ("q", "退出", Some(KeyCode::Char('q'))),
-        ],
+        Focus::List => {
+            let mut pairs = vec![
+                ("Enter/r", "恢复", Some(KeyCode::Enter)),
+                ("e", edit, Some(KeyCode::Char('e'))),
+                ("Space", "速览", Some(KeyCode::Char(' '))),
+                ("Tab", "分栏", Some(KeyCode::Tab)),
+                ("o", "全文", Some(KeyCode::Char('o'))),
+                ("y/Y", "复制ID/命令", None),
+                (filters, "筛选", None),
+                ("/", "搜索", Some(KeyCode::Char('/'))),
+                ("q", "退出", Some(KeyCode::Char('q'))),
+            ];
+            if app.split {
+                pairs.insert(4, ("O", "切换顺序", Some(KeyCode::Char('O'))));
+            }
+            pairs
+        }
     };
     hints(
         &mut spans,
@@ -733,29 +814,34 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
     .areas(outer);
 
     let row = &reader.row;
-    let title = if row.text.is_empty() {
-        "（无标题）".to_string()
-    } else {
-        text::sanitize_line(&row.text)
-    };
+    let title = title_span(&row.title, theme::bold());
+    let title = Span::styled(
+        fit_width(&title.content, header.width as usize),
+        title.style,
+    );
     let loaded = reader.records.len();
     let header_lines = vec![
-        Line::from(Span::styled(
-            fit_width(&title, header.width as usize),
-            theme::bold(),
-        )),
+        Line::from(title),
         Line::from(vec![
             Span::styled("● ", Style::default().fg(theme::source_color(&row.source))),
             Span::styled(text::sanitize_line(&row.source), theme::muted()),
             Span::styled(
                 format!(
-                    "  {}  {}  {}  ·  已加载 {loaded}{} 条",
+                    "  {}  {}  {}  ·  已加载 {loaded}{} 条  ·  ",
                     text::sanitize_line(&row.project),
                     row.key.machine,
                     text::sanitize_line(&row.key.session_id),
                     reader.total.map(|t| format!("/{t}")).unwrap_or_default()
                 ),
                 theme::faint(),
+            ),
+            Span::styled(
+                if reader.newest_first {
+                    "最新在前"
+                } else {
+                    "最早在前"
+                },
+                theme::muted(),
             ),
         ]),
     ];
@@ -777,12 +863,18 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
         width,
         reader.expand_tools,
         reader.records.len(),
+        reader.start,
+        reader.newest_first,
         reader.find.clone(),
     );
     if reader.layout_key.as_ref() != Some(&layout_key) {
+        // Keep the record at the top where it is: pages added above it, a narrower window or
+        // unfolded tools would otherwise move the text under the reader's eyes.
+        let keep = reader.top_record();
         let mut lines = Vec::new();
         let mut starts = std::collections::HashMap::new();
-        for record in &reader.records {
+        let mut line_starts = Vec::new();
+        for record in reader.shown() {
             let anchor = row.record_id.as_deref() == Some(record.record_id.as_str());
             let paras = md::record(
                 record,
@@ -797,26 +889,41 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
                 continue;
             }
             starts.insert(record.record_id.clone(), lines.len());
+            line_starts.push((lines.len(), record.record_id.clone()));
             lines.extend(md::wrap(&paras, width, 0));
         }
         reader.lines = lines;
         reader.record_lines = starts;
+        reader.line_starts = line_starts;
         reader.layout_key = Some(layout_key);
+        if let Some((id, into)) = keep
+            && let Some(&line) = reader.record_lines.get(&id)
+        {
+            reader.scroll = line + into;
+        }
     }
     reader.view_height = body.height as usize;
     if reader.jump_to_anchor
-        && let Some(id) = &row.record_id
+        && let Some(id) = &reader.row.record_id
         && let Some(&line) = reader.record_lines.get(id)
     {
         reader.scroll = line.saturating_sub(2);
         reader.jump_to_anchor = false;
     }
+    if reader.to_bottom && !reader.records.is_empty() {
+        reader.scroll = reader.lines.len().saturating_sub(body.height as usize);
+        reader.to_bottom = false;
+    }
     let mut lines = reader.lines.clone();
-    if reader.loading || (reader.records.is_empty() && reader.error.is_none()) {
-        lines.push(Line::from(vec![
-            Span::styled(SPINNER[tick % SPINNER.len()], theme::accent()),
-            Span::styled(" 加载中…", theme::muted()),
-        ]));
+    if reader.records.is_empty() && reader.error.is_none() {
+        lines.push(if reader.loading || reader.total != Some(0) {
+            Line::from(vec![
+                Span::styled(SPINNER[tick % SPINNER.len()], theme::accent()),
+                Span::styled(" 加载中…", theme::muted()),
+            ])
+        } else {
+            Line::styled("（没有可显示的消息）", theme::muted())
+        });
     }
     if let Some(error) = &reader.error {
         lines.push(Line::styled(
@@ -845,6 +952,7 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let total_lines = reader.lines.len().max(1);
     let percent = ((reader.scroll + body.height as usize).min(total_lines) * 100) / total_lines;
+    let loading = reader.loading && !reader.records.is_empty();
     let mut spans = Vec::new();
     if let Some(message) = status {
         spans.push(Span::styled(format!("{message}   "), theme::accent()));
@@ -854,10 +962,14 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         "打印命令"
     };
-    let position = format!("{percent}%");
+    let position = if loading {
+        format!("{} {percent}%", SPINNER[tick % SPINNER.len()])
+    } else {
+        format!("{percent}%")
+    };
     let [l, r] = Layout::horizontal([
         Constraint::Min(10),
-        Constraint::Length(position.len() as u16 + 1),
+        Constraint::Length(display_width(&position) as u16 + 1),
     ])
     .areas(footer);
     hints(
@@ -867,6 +979,7 @@ fn draw_reader(frame: &mut Frame, area: Rect, app: &mut App) {
             ("j/k", "滚动", None),
             ("d/u", "半页", None),
             ("g/G", "首尾", None),
+            ("O", "切换顺序", Some(KeyCode::Char('O'))),
             ("/", "查找", Some(KeyCode::Char('/'))),
             ("n/N", "下/上一个", None),
             (
@@ -969,7 +1082,7 @@ mod tests {
         assert!(screen.contains("全部来源"));
     }
 
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -1152,5 +1265,183 @@ mod tests {
         assert_eq!(app.preview_scroll, 3);
         wheel(&mut app, (list.x + 2, list.y));
         assert_eq!(app.selected, 1);
+    }
+
+    fn screen_text(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < buffer.area.width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += UnicodeWidthStr::width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    fn record(i: u32) -> RecordView {
+        RecordView {
+            record_id: format!("r{i}"),
+            ts_ms: 1_700_000_000_000 + i as i64 * 60_000,
+            role: if i.is_multiple_of(2) {
+                "user"
+            } else {
+                "assistant"
+            }
+            .into(),
+            tool_name: None,
+            text: format!("message {i}"),
+            total_chars: 9,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn previews_put_the_newest_first_or_last() {
+        use super::super::load::Part;
+        let preview = Preview {
+            parts: vec![
+                Part {
+                    offset: 0,
+                    records: (0..2).map(record).collect(),
+                },
+                Part {
+                    offset: 8,
+                    records: (8..10).map(record).collect(),
+                },
+            ],
+            total: Some(12),
+        };
+        let names = |newest| -> Vec<String> {
+            preview_items(&preview, newest)
+                .into_iter()
+                .map(|item| match item {
+                    Shown::Record(r) => r.record_id.clone(),
+                    Shown::Gap(n) => format!("gap {n}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(false),
+            ["r0", "r1", "gap 6", "r8", "r9", "gap 2"],
+            "the tail that did not come back is counted too"
+        );
+        assert_eq!(names(true), ["gap 2", "r9", "r8", "gap 6", "r1", "r0"]);
+
+        let mut app = sessions_app(&[("a", "claude")]);
+        app.split = true;
+        app.focus = Focus::List;
+        let key = app.preview_key().unwrap();
+        app.previews.insert(key, PreviewState::Ready(preview));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = screen_text(&terminal).join("\n");
+        assert!(screen.contains("title a"), "the title heads the preview");
+        assert!(screen.contains("最新在前"), "{screen}");
+        assert!(screen.contains("O 切换顺序"), "split footer hint");
+        let at = |s: &str| screen.find(s).unwrap_or_else(|| panic!("{s}: {screen}"));
+        assert!(at("message 9") < at("message 8"));
+        assert!(at("message 8") < at("省略 6 条"));
+        assert!(at("省略 6 条") < at("message 0"));
+    }
+
+    #[test]
+    fn hits_show_the_session_title_before_the_snippet() {
+        let mut app = App::new(vec!["local".into()], "部署".into(), true);
+        app.take_effects();
+        let generation = app.generation;
+        let hit = |id: &str, title: &str, snippet: &str| crate::model::SearchHit {
+            score: 1.0,
+            ts_ms: now_ms(),
+            source: "claude".into(),
+            session_id: id.into(),
+            source_path: format!("/{id}"),
+            record_id: format!("{id}-0-0"),
+            project: "shop".into(),
+            role: "user".into(),
+            snippet: snippet.into(),
+            title: Some(title.into()),
+        };
+        app.on_msg(super::super::load::Msg::Rows {
+            generation,
+            outcome: crate::fanout::Outcome {
+                machine: "local".into(),
+                result: Ok(crate::rpc::Response {
+                    reply: crate::proto::Reply::Search {
+                        hits: vec![
+                            hit("a", "订单接口 502 排查", "回滚之后再部署一次"),
+                            hit(
+                                "b",
+                                "帮我部署到预发环境",
+                                "帮我部署到预发环境，然后跑一遍冒烟",
+                            ),
+                        ],
+                    },
+                    took_ms: 1,
+                    wire_bytes: 1,
+                }),
+                elapsed: std::time::Duration::from_millis(3),
+                via: crate::fanout::Via::Local,
+            },
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = screen_text(&terminal);
+        let row = screen.iter().find(|l| l.contains("回滚之后")).unwrap();
+        let (title, snippet) = (row.find("订单接口 502 排查"), row.find("回滚之后"));
+        assert!(title.unwrap() < snippet.unwrap(), "{row}");
+        // The title is the first question and the hit is in it: shown once.
+        let row = screen.iter().find(|l| l.contains("冒烟")).unwrap();
+        assert_eq!(row.matches("帮我部署到预发环境").count(), 1, "{row}");
+
+        // Beside the preview there is room for the title only.
+        app.split = true;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = screen_text(&terminal);
+        let row = screen.iter().find(|l| l.contains("订单接口")).unwrap();
+        let list = row.split('│').next().unwrap();
+        assert!(!list.contains("回滚之后"), "{row}");
+    }
+
+    #[test]
+    fn the_reader_keeps_its_place_when_pages_arrive_above() {
+        let mut app = sessions_app(&[("a", "claude")]);
+        app.focus = Focus::List;
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let key = app.reader.as_ref().unwrap().row.key.clone();
+        let page = |offset: u32, count: u32| crate::model::Page {
+            session_id: "a".into(),
+            source_path: "/a".into(),
+            offset,
+            total: Some(100),
+            next_offset: None,
+            records: (offset..offset + count).map(record).collect(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        app.on_msg(super::super::load::Msg::Page {
+            key: key.clone(),
+            generation: 0,
+            result: Ok(page(40, 20)),
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let reader = app.reader.as_mut().unwrap();
+        assert_eq!(reader.top_record().unwrap().0, "r59", "newest first");
+        reader.scroll = reader.record_lines["r50"] + 1;
+        // Newer records arrive; newest first they go above what is on screen.
+        app.on_msg(super::super::load::Msg::Page {
+            key,
+            generation: 0,
+            result: Ok(page(60, 10)),
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let reader = app.reader.as_ref().unwrap();
+        assert_eq!(reader.top_record(), Some(("r50".to_string(), 1)));
+        assert_eq!(reader.shown().next().unwrap().record_id, "r69");
+        let screen = screen_text(&terminal).join("\n");
+        assert!(screen.contains("已加载 30/100 条"), "{screen}");
     }
 }

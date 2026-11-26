@@ -139,8 +139,12 @@ pub async fn run(runner: Arc<Runner>, options: TuiOptions) -> Result<Exit> {
                     let task = loader.preview(key.clone());
                     preview = Some((key, task));
                 }
-                Effect::Page { key, offset } => {
-                    loader.reader_page(key, offset);
+                Effect::Page {
+                    key,
+                    generation,
+                    span,
+                } => {
+                    loader.reader_page(key, generation, span);
                 }
                 Effect::Command { key, purpose } => {
                     loader.command(key, purpose);

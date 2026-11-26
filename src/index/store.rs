@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_last ON sessions(last_ms DESC);
 CREATE INDEX IF NOT EXISTS sessions_sid ON sessions(session_id);
 CREATE INDEX IF NOT EXISTS sessions_file ON sessions(file_id);
+-- Titles a source keeps outside its transcripts (Codex's thread names). They win over the
+-- title parsed from the transcript.
+CREATE TABLE IF NOT EXISTS names (
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    PRIMARY KEY (source, session_id)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS records (
     sess INTEGER NOT NULL,
     seq INTEGER NOT NULL,
@@ -260,7 +268,9 @@ impl Store {
             .prepare_cached(
                 "INSERT INTO sessions (id, file_id, source, session_id, path, cwd, project, title,
                     started_ms, last_ms, messages, records, kind, parent, extra)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    COALESCE((SELECT title FROM names WHERE source = ?3 AND session_id = ?4), ?8),
+                    ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(id) DO UPDATE SET file_id = excluded.file_id, source = excluded.source,
                     session_id = excluded.session_id, path = excluded.path, cwd = excluded.cwd,
                     project = excluded.project, title = excluded.title,
@@ -285,6 +295,20 @@ impl Store {
                 s.parent,
                 s.extra
             ])?;
+        Ok(())
+    }
+
+    /// Name a session from outside its transcript; the name sticks when it is parsed again.
+    pub fn put_name(&self, source: &str, session_id: &str, title: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO names (source, session_id, title) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(source, session_id) DO UPDATE SET title = excluded.title",
+            )?
+            .execute(params![source, session_id, title])?;
+        self.conn
+            .prepare_cached("UPDATE sessions SET title = ?3 WHERE source = ?1 AND session_id = ?2")?
+            .execute(params![source, session_id, title])?;
         Ok(())
     }
 

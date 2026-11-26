@@ -86,6 +86,9 @@ pub struct SearchHit {
     pub role: String,
     #[serde(default)]
     pub snippet: String,
+    /// The session's title. Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +143,10 @@ pub struct ReadRequest {
     /// so that long outputs do not crowd out the conversation. Unset keeps them whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_chars: Option<u32>,
+    /// Characters kept of every record before the page budget is shared out, so that a page
+    /// of previews reaches its last record. Older servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_chars: Option<u32>,
 }
 
 /// Records around one record, for showing a search hit in place.
@@ -303,6 +310,7 @@ impl ReadRequest {
             limit: READ_LIMIT_DEFAULT,
             max_chars: MAX_CHARS_DEFAULT,
             tool_chars: None,
+            record_chars: None,
         }
     }
 
@@ -312,7 +320,8 @@ impl ReadRequest {
         }
         check_range("limit", self.limit, 1, READ_LIMIT_MAX)?;
         check_range("max_chars", self.max_chars, MAX_CHARS_MIN, MAX_CHARS_MAX)?;
-        check_tool_chars(self.tool_chars)
+        check_chars("tool_chars", self.tool_chars)?;
+        check_chars("record_chars", self.record_chars)
     }
 }
 
@@ -335,13 +344,13 @@ impl ContextRequest {
         check_range("before", self.before, 0, CONTEXT_SIDE_MAX)?;
         check_range("after", self.after, 0, CONTEXT_SIDE_MAX)?;
         check_range("max_chars", self.max_chars, MAX_CHARS_MIN, MAX_CHARS_MAX)?;
-        check_tool_chars(self.tool_chars)
+        check_chars("tool_chars", self.tool_chars)
     }
 }
 
-fn check_tool_chars(value: Option<u32>) -> Result<(), String> {
+fn check_chars(name: &str, value: Option<u32>) -> Result<(), String> {
     match value {
-        Some(v) => check_range("tool_chars", v, 1, MAX_CHARS_MAX),
+        Some(v) => check_range(name, v, 1, MAX_CHARS_MAX),
         None => Ok(()),
     }
 }

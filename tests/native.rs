@@ -597,3 +597,67 @@ fn excluding_a_session_drops_its_subagents_too() {
     let hits = env.index.search(&req).unwrap();
     assert!(hits.iter().all(|h| h.project != "shop-api"), "{hits:#?}");
 }
+
+#[test]
+fn codex_thread_names_title_their_sessions() {
+    let env = env();
+    let main = |env: &Env| {
+        sessions_of(&env.index, "codex")
+            .into_iter()
+            .find(|s| s.kind.as_deref() == Some("main"))
+            .unwrap()
+    };
+    let before = main(&env);
+    let names = env.home.join(".codex/session_index.jsonl");
+    std::fs::write(&names, "").unwrap();
+    let line = |name: &str| {
+        format!(
+            r#"{{"id":"{}","thread_name":"{name}","updated_at":"2026-03-14T09:31:00Z"}}"#,
+            before.session_id
+        )
+    };
+    append(&names, &line("整理  基础设施笔记"));
+    let named = main(&env);
+    assert_eq!(named.title.as_deref(), Some("整理 基础设施笔记"));
+    assert_ne!(before.title, named.title);
+    let hit = search(&env.index, "schema migration")
+        .into_iter()
+        .find(|h| h.session_id == before.session_id)
+        .expect("a hit in the named session");
+    assert_eq!(hit.title.as_deref(), Some("整理 基础设施笔记"));
+
+    // A rename appends another line; an unfinished one waits for its newline.
+    append(&names, &line("基础设施笔记 v2"));
+    let mut text = std::fs::read_to_string(&names).unwrap();
+    text.push_str(r#"{"id":"x","thread_na"#);
+    std::fs::write(&names, text).unwrap();
+    assert_eq!(main(&env).title.as_deref(), Some("基础设施笔记 v2"));
+
+    // The name outlives parsing the transcript again.
+    env.index
+        .refresh(&Options {
+            rebuild: true,
+            ..Options::default()
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(main(&env).title.as_deref(), Some("基础设施笔记 v2"));
+}
+
+#[test]
+fn claude_recaps_are_summary_records() {
+    let env = env();
+    let hits = env
+        .index
+        .search(&SearchRequest {
+            filters: Filters {
+                role: Some("summary".into()),
+                ..Filters::default()
+            },
+            ..SearchRequest::new("regression")
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(hits[0].role, "summary");
+    assert_eq!(hits[0].title.as_deref(), Some("订单接口 502 排查"));
+}

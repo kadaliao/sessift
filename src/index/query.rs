@@ -275,6 +275,7 @@ impl NativeIndex {
                     session_id: session.session_id,
                     source_path: session.path,
                     project: session.project,
+                    title: session.title,
                 }
             })
             .collect())

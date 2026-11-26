@@ -321,6 +321,7 @@ mod tests {
             project: String::new(),
             role: "user".into(),
             snippet: String::new(),
+            title: None,
         }
     }
 

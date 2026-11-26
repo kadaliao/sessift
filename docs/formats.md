@@ -4,13 +4,13 @@
 
 ## 共同约定
 
-- 记录有四种角色：`user`、`assistant`、`tool_use`、`tool_result`。思考过程（thinking、reasoning）、系统提示、工具定义和注入的上下文都不当作记录。
+- 记录有五种角色：`user`、`assistant`、`tool_use`、`tool_result`，以及 `summary`（agent 自己写的会话回顾，目前只有 Claude Code 的）。思考过程（thinking、reasoning）、系统提示、工具定义和注入的上下文都不当作记录。
 - **记录的位置**：JSONL 来源用"行首字节偏移 + 行长 + 行内序号"，压缩文件按解压后的偏移算。OpenCode 用"part 在会话中的序号 + 子序号"（工具 part 的调用是 0，结果是 1）。
 - **记录 ID**：`<会话键>-<偏移>-<序号>`，只要原文件不被改写就保持稳定。
 - **解析约定**：一行产生哪些记录、文字是什么，只能取决于这一行本身。跨行状态只能用来补元数据（工具名、标题、cwd），或者整行跳过。读回记录时，单独重新解析那一行，按序号取对应的记录。测试会对每个样本核对这一点。
 - **未写完的末行**：普通文件里没有换行结尾的最后一行可能还在写，留到下次再解析。压缩文件已经写完，末行照常解析。中间有坏行就跳过并计数。
 - **图片**：图片和 base64 数据永远不进索引。Claude 的工具输出里图片占原始字节的 35%，Codex 占 53%，Pi 占 78%，Grok 的对话记录里占 57%。
-- **标题**：取第一条真正的用户消息，压成一行，最多 80 字。各来源的例外见下文。
+- **标题**：用户起的名字优先，其次是 agent 自己生成的标题（会概括会话，比第一句话短，也更好分辨），都没有时取第一条真正的用户消息。压成一行，最多 80 字。各来源的规则见下文。
 - **消息数**：用户消息加助手消息的条数。
 
 ## Claude Code
@@ -34,7 +34,8 @@
   - `assistant`：每个 `text` 块是一条助手记录，每个 `tool_use` 块是一条工具调用。`thinking` 跳过。`model` 为 `<synthetic>` 或带 `isApiErrorMessage` 的行是客户端报错，跳过。
   - `user`：带 `isMeta` 或 `isCompactSummary` 的整行跳过。`tool_result` 块是工具结果，工具名通过 `tool_use_id` 找。`text` 块是用户消息，但 `origin.kind` 不是 `human` 时跳过（任务通知、其他会话发来的消息）。
   - `attachment`：只有 `queued_command`（用户在 agent 忙时打的字）而且 `origin` 是人时，才是用户消息。
-  - `custom-title`、`ai-title`、`agent-name`、`summary`：标题候选，后出现的覆盖先出现的。
+  - `custom-title`、`ai-title`、`agent-name`、`summary`：标题候选，后出现的覆盖先出现的。`ai-title` 是 Claude Code 生成的标题，会话进行中会随话题更新（一个会话里常有几十行），2026-11 本机 30 天内约七成会话有。
+  - `system` 里 `subtype` 为 `away_summary` 的是回顾：用户离开一阵再回来时，Claude Code 写的"目标、进展、下一步"，2026-11 本机约四成会话有，一半是中文。取 `content`，去掉末尾的 `(disable recaps in /config)`，作为一条 `summary` 记录。其他 `system` 行跳过。
   - 其余类型跳过，包括 `api-request-blob`。它占字节数的 17%，`message` 里是请求内容的副本。
 - **用户文字的处理**：
   - 以 `<system-reminder>`、`<task-notification>`、`<local-command-caveat>`、`[Request interrupted by user` 开头的跳过。
@@ -54,9 +55,10 @@
 - **标题优先级**：
   1. 自定义标题。
   2. 子 agent 的 description。
-  3. 第一条真正的提问（Claude Code 自己的规则：跳过以标签开头的消息、被打断的消息，记下第一个斜杠命令作为兜底，去掉 `[Image #N]`）。
-  4. AI 生成的标题、agent 名、旧版 summary。
-  5. 最先出现的斜杠命令。
+  3. AI 生成的标题（`ai-title`）。
+  4. 第一条真正的提问（Claude Code 自己的规则：跳过以标签开头的消息、被打断的消息，记下第一个斜杠命令作为兜底，去掉 `[Image #N]`）。
+  5. agent 名、旧版 summary。
+  6. 最先出现的斜杠命令。
 - **恢复**：`cd '<cwd>' && claude --resume <id>`；子 agent 恢复它的父会话。
 - **增量**：文件只追加，但 Claude Code 也有整文件改写的路径，所以每次核对上次解析位置前 256 字节的指纹，对不上就整文件重解析。
 
@@ -88,7 +90,10 @@
   - `*_output`：工具结果。`{"output": …, "metadata": …}` 形式的字符串取 `output`；数组里的图片显示为 `[image]`。
   - `agent_message`：多 agent 之间的消息，只取明文部分，当作工具结果。
   - `reasoning`、`additional_tools` 等跳过。
-- **标题**：第一条用户消息。IDE 或桌面版的包装（`## My request for Codex:`、`## My request:`）只取最后一段。以 `<heartbeat>`、`<codex_delegation>` 开头的不算。subagent 没有用户消息时，用 `agent_path`。
+- **标题**：
+  - 线程名优先。它不在 rollout 里，而在 Codex home 下的 `session_index.jsonl`：每给一个线程起名（Codex 在第一轮之后自动起，`/rename` 改）就追加一行 `{"id", "thread_name", "updated_at"}`，同一个线程以最后一行为准。2026-11 本机 729 个对话里 690 个有线程名。
+  - 这个文件只追加，入库时记住读到的位置（`meta` 表的 `names:<路径>`），只读新增的完整行；inode 变了或文件变短就从头读。名字存进 `names` 表，同时改掉已有会话的标题；之后重新解析 rollout 时，`names` 里的名字仍然优先。
+  - 没有线程名时用第一条用户消息。IDE 或桌面版的包装（`## My request for Codex:`、`## My request:`）只取最后一段。以 `<heartbeat>`、`<codex_delegation>` 开头的不算。subagent 没有用户消息时，用 `agent_path`。
 - **恢复**：`cd '<cwd>' && codex resume <id>`；subagent 和 guardian 恢复父会话。
 - **增量**：`.jsonl` 只追加。`.zst` 不再变化，一旦变化就整文件重解析。
 

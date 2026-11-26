@@ -112,6 +112,9 @@ impl Backend {
                 if let Some(cap) = req.tool_chars {
                     text::cap_tools(&mut page.records, cap as usize);
                 }
+                if let Some(cap) = req.record_chars {
+                    text::cap_records(&mut page.records, cap as usize);
+                }
                 let kept = text::fit_page(&mut page.records, req.max_chars as usize);
                 if kept < page.records.len() {
                     page.records.truncate(kept);
@@ -156,6 +159,66 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ReadRequest, RecordView, SessionSummary};
+
+    #[tokio::test]
+    async fn record_chars_cut_each_record_before_the_page_budget() {
+        let record = |i: u32| RecordView {
+            record_id: format!("r{i}"),
+            ts_ms: i as i64,
+            role: if i == 1 { "tool_result" } else { "assistant" }.into(),
+            tool_name: None,
+            text: "字".repeat(400),
+            total_chars: 400,
+            truncated: false,
+        };
+        let session = SessionSummary {
+            source: "claude".into(),
+            session_id: "s".into(),
+            source_path: "/s".into(),
+            project: String::new(),
+            cwd: None,
+            title: None,
+            started_ms: None,
+            last_ms: 1,
+            message_count: Some(6),
+            kind: None,
+            resume_cmd: None,
+        };
+        let data = fixture::FixtureData {
+            sessions: vec![session],
+            records: [("s".to_string(), (0..6).map(record).collect())].into(),
+        };
+        let backend = Backend::Fixture(fixture::FixtureBackend::from_data(
+            data,
+            std::time::Duration::ZERO,
+        ));
+        let read = |record_chars| {
+            Op::Read(ReadRequest {
+                max_chars: 1000,
+                tool_chars: Some(50),
+                record_chars,
+                ..ReadRequest::new("s")
+            })
+        };
+        let Ok(Reply::Page(page)) = backend.execute(&read(None)).await else {
+            panic!("a page");
+        };
+        assert_eq!(page.records.len(), 4, "the budget runs out in the fourth");
+        assert_eq!(page.next_offset, Some(4));
+        let Ok(Reply::Page(page)) = backend.execute(&read(Some(150))).await else {
+            panic!("a page");
+        };
+        assert_eq!(page.records.len(), 6, "cut first, every record fits");
+        assert_eq!(page.next_offset, None);
+        let lengths: Vec<usize> = page
+            .records
+            .iter()
+            .map(|r| r.text.chars().count())
+            .collect();
+        assert_eq!(lengths, [150, 50, 150, 150, 150, 150]);
+        assert!(page.records.iter().all(|r| r.truncated));
+    }
 
     #[test]
     fn an_old_memex_config_says_what_to_change() {

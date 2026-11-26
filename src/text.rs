@@ -170,12 +170,30 @@ pub fn fit_page(records: &mut [RecordView], max_chars: usize) -> usize {
     records.len()
 }
 
+/// Whether a search hit's snippet already shows the session's title, as when the title is
+/// the first question and the hit is in it. An empty title counts as shown.
+pub fn title_in_snippet(title: &str, snippet: &str) -> bool {
+    let head: String = title.trim_end_matches('…').chars().take(24).collect();
+    let head = head.trim();
+    head.is_empty() || collapse_ws(snippet).contains(head)
+}
+
 /// Cut each tool call and tool output to `max` characters.
 pub fn cap_tools(records: &mut [RecordView], max: usize) {
+    let tools = records
+        .iter_mut()
+        .filter(|r| matches!(r.role.as_str(), "tool_use" | "tool_result"));
+    cap(tools, max);
+}
+
+/// Cut every record to `max` characters.
+pub fn cap_records(records: &mut [RecordView], max: usize) {
+    cap(records.iter_mut(), max);
+}
+
+fn cap<'a>(records: impl Iterator<Item = &'a mut RecordView>, max: usize) {
     for record in records {
-        if matches!(record.role.as_str(), "tool_use" | "tool_result")
-            && char_len(&record.text) > max
-        {
+        if char_len(&record.text) > max {
             record.text = truncate_chars(&record.text, max).0;
             record.truncated = true;
         }

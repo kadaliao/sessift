@@ -10,7 +10,7 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 
-use super::load::{Key, Msg, Preview, PreviewKey, Purpose};
+use super::load::{Key, Msg, Preview, PreviewKey, Purpose, Span};
 use crate::fanout::{Outcome, merge_hits, merge_sessions};
 use crate::model::{Filters, RecordView, SearchRequest, SessionsRequest};
 use crate::pick::Chosen;
@@ -34,6 +34,8 @@ pub struct Row {
     pub project: String,
     /// Session title, or the hit's snippet.
     pub text: String,
+    /// The session's title, for hits too (empty when the remote did not send it).
+    pub title: String,
     pub message_count: Option<u64>,
 }
 
@@ -175,7 +177,8 @@ pub enum Effect {
     Preview(PreviewKey),
     Page {
         key: Key,
-        offset: u32,
+        generation: u64,
+        span: Span,
     },
     Command {
         key: Key,
@@ -191,13 +194,30 @@ pub enum Exit {
     Edit(Chosen),
 }
 
-/// Full-screen reading of one session.
+/// Where a reader with nothing loaded starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Begin {
+    Hit(String),
+    Start,
+    End,
+}
+
+/// Full-screen reading of one session. It holds a window of consecutive records that grows
+/// at either end as the reader scrolls towards it, so it can open at a hit in the middle of
+/// a long session or at its end without reading everything before.
 pub struct Reader {
     pub row: Row,
+    /// Records in session order, `start..start + records.len()`.
     pub records: Vec<RecordView>,
-    pub next_offset: Option<u32>,
+    pub start: u32,
     pub total: Option<u32>,
+    pub newest_first: bool,
     pub loading: bool,
+    /// Bumped when the window starts over; pages asked for before are dropped.
+    pub generation: u64,
+    begin: Begin,
+    /// A page brought nothing new; stop asking until the window starts over.
+    stalled: bool,
     pub error: Option<String>,
     pub scroll: usize,
     pub expand_tools: bool,
@@ -206,23 +226,36 @@ pub struct Reader {
     pub find: Option<String>,
     /// Laid-out lines, rebuilt by the view when the inputs change.
     pub lines: Vec<Line<'static>>,
-    pub layout_key: Option<(usize, bool, usize, Option<String>)>,
+    pub layout_key: Option<(usize, bool, usize, u32, bool, Option<String>)>,
     /// First line of each record in `lines`, by record id.
     pub record_lines: HashMap<String, usize>,
+    /// The same, in line order: which record the top line belongs to.
+    pub line_starts: Vec<(usize, String)>,
     pub view_height: usize,
     /// Scroll to the hit once it has been loaded and laid out.
     pub jump_to_anchor: bool,
+    /// Scroll to the bottom once laid out.
+    pub to_bottom: bool,
 }
 
 impl Reader {
-    fn new(row: Row) -> Self {
-        let jump_to_anchor = row.record_id.is_some();
+    fn new(row: Row, newest_first: bool, total: Option<u32>) -> Self {
+        let begin = match (&row.record_id, newest_first) {
+            (Some(id), _) => Begin::Hit(id.clone()),
+            (None, true) => Begin::End,
+            (None, false) => Begin::Start,
+        };
         Self {
+            jump_to_anchor: row.record_id.is_some(),
             row,
             records: Vec::new(),
-            next_offset: Some(0),
-            total: None,
+            start: 0,
+            total,
+            newest_first,
             loading: false,
+            generation: 0,
+            begin,
+            stalled: false,
             error: None,
             scroll: 0,
             expand_tools: false,
@@ -231,9 +264,126 @@ impl Reader {
             lines: Vec::new(),
             layout_key: None,
             record_lines: HashMap::new(),
+            line_starts: Vec::new(),
             view_height: 20,
-            jump_to_anchor,
+            to_bottom: false,
         }
+    }
+
+    pub fn end(&self) -> u32 {
+        self.start + self.records.len() as u32
+    }
+
+    fn has_older(&self) -> bool {
+        self.start > 0
+    }
+
+    fn has_newer(&self) -> bool {
+        self.total.is_some_and(|t| self.end() < t)
+    }
+
+    /// Records in the order they are shown.
+    pub fn shown(&self) -> Box<dyn Iterator<Item = &RecordView> + '_> {
+        if self.newest_first {
+            Box::new(self.records.iter().rev())
+        } else {
+            Box::new(self.records.iter())
+        }
+    }
+
+    /// Start over from one end of the session (`newest`: its end), shown at the top or the
+    /// bottom of the screen. Keeps what is loaded when that end is already there.
+    fn restart(&mut self, newest: bool, at_bottom: bool) {
+        let loaded = if newest {
+            !self.records.is_empty() && !self.has_newer()
+        } else {
+            !self.records.is_empty() && !self.has_older()
+        };
+        if !loaded {
+            self.records.clear();
+            self.start = 0;
+            self.generation += 1;
+            self.loading = false;
+            self.stalled = false;
+            self.error = None;
+            self.begin = if newest { Begin::End } else { Begin::Start };
+        }
+        self.jump_to_anchor = false;
+        self.layout_key = None;
+        self.lines.clear();
+        self.line_starts.clear();
+        self.record_lines.clear();
+        self.scroll = 0;
+        self.to_bottom = at_bottom;
+    }
+
+    fn set_order(&mut self, newest_first: bool) {
+        self.newest_first = newest_first;
+        self.restart(newest_first, false);
+    }
+
+    /// The page to ask for next, if any: the first one, or more at an end being neared.
+    fn next_span(&self) -> Option<Span> {
+        if self.loading || self.stalled || self.error.is_some() {
+            return None;
+        }
+        if self.records.is_empty() {
+            return Some(match &self.begin {
+                // Mostly what came after the hit (or, newest first, before it): that is what
+                // follows it on screen.
+                Begin::Hit(id) => Span::Around {
+                    record_id: id.clone(),
+                    before: if self.newest_first { 80 } else { 20 },
+                    after: if self.newest_first { 20 } else { 80 },
+                },
+                Begin::Start => Span::From(0),
+                Begin::End => Span::Before(self.total.unwrap_or(u32::MAX)),
+            });
+        }
+        let older = self.has_older().then_some(Span::Before(self.start));
+        let newer = self.has_newer().then(|| Span::From(self.end()));
+        let (above, below) = if self.newest_first {
+            (newer, older)
+        } else {
+            (older, newer)
+        };
+        let height = self.view_height.max(1);
+        if self.scroll + height * 2 >= self.lines.len()
+            && let Some(span) = below
+        {
+            return Some(span);
+        }
+        if self.scroll < height {
+            return above;
+        }
+        None
+    }
+
+    /// Add a page that touches the window. Returns false when it brought nothing new.
+    fn merge(&mut self, page: crate::model::Page) -> bool {
+        if page.total.is_some() {
+            self.total = page.total;
+        }
+        if page.records.is_empty() {
+            return false;
+        }
+        let (from, to) = (page.offset, page.offset + page.records.len() as u32);
+        if self.records.is_empty() {
+            self.start = from;
+            self.records = page.records;
+        } else if from < self.start && to >= self.start {
+            let mut records = page.records;
+            records.truncate((self.start - from) as usize);
+            records.append(&mut self.records);
+            self.records = records;
+            self.start = from;
+        } else if from <= self.end() && to > self.end() {
+            let skip = (self.end() - from) as usize;
+            self.records.extend(page.records.into_iter().skip(skip));
+        } else {
+            return false;
+        }
+        true
     }
 
     fn max_scroll(&self) -> usize {
@@ -243,6 +393,16 @@ impl Reader {
     fn scroll_by(&mut self, delta: isize) {
         let target = self.scroll as isize + delta;
         self.scroll = target.clamp(0, self.max_scroll() as isize) as usize;
+    }
+
+    /// The record the top line belongs to, and how many lines into it.
+    pub fn top_record(&self) -> Option<(String, usize)> {
+        let at = self
+            .line_starts
+            .partition_point(|(line, _)| *line <= self.scroll)
+            .checked_sub(1)?;
+        let (line, id) = &self.line_starts[at];
+        Some((id.clone(), self.scroll - line))
     }
 
     /// Line indices containing the find term.
@@ -308,6 +468,8 @@ pub struct App {
     pub focus: Focus,
     pub split: bool,
     pub peek: bool,
+    /// Previews and the reader show the newest records first.
+    pub newest_first: bool,
     pub rows: Vec<Row>,
     pub selected: usize,
     pub list_offset: usize,
@@ -355,6 +517,7 @@ impl App {
             focus: Focus::Query,
             split: false,
             peek: false,
+            newest_first: true,
             rows: Vec::new(),
             selected: 0,
             list_offset: 0,
@@ -461,6 +624,7 @@ impl App {
         self.selected_row().map(|row| PreviewKey {
             key: row.key.clone(),
             record_id: row.record_id.clone(),
+            newest_first: row.record_id.is_some() && self.newest_first,
         })
     }
 
@@ -493,6 +657,11 @@ impl App {
                     source: hit.item.source,
                     project: hit.item.project,
                     text: crate::text::collapse_ws(&hit.item.snippet),
+                    title: hit
+                        .item
+                        .title
+                        .map(|t| crate::text::collapse_ws(&t))
+                        .unwrap_or_default(),
                     message_count: None,
                 });
             }
@@ -503,6 +672,11 @@ impl App {
                 0,
                 LIST_LIMIT as usize * self.machines.len().max(1),
             ) {
+                let title = session
+                    .item
+                    .title
+                    .map(|t| crate::text::collapse_ws(&t))
+                    .unwrap_or_default();
                 rows.push(Row {
                     key: Key {
                         machine: session.machine,
@@ -513,11 +687,8 @@ impl App {
                     ts_ms: session.item.last_ms,
                     source: session.item.source,
                     project: session.item.project,
-                    text: session
-                        .item
-                        .title
-                        .map(|t| crate::text::collapse_ws(&t))
-                        .unwrap_or_default(),
+                    text: title.clone(),
+                    title,
                     message_count: session.item.message_count,
                 });
             }
@@ -593,24 +764,32 @@ impl App {
             }
             Msg::Page {
                 key,
-                offset,
+                generation,
                 result,
             } => {
                 let Some(reader) = self.reader.as_mut() else {
                     return;
                 };
-                if reader.row.key != key {
+                if reader.row.key != key || reader.generation != generation {
                     return;
                 }
                 reader.loading = false;
                 match result {
-                    Ok(page) if page.offset == offset => {
-                        reader.records.extend(page.records);
-                        reader.total = page.total;
-                        reader.next_offset = page.next_offset;
-                        reader.layout_key = None;
+                    Ok(page) => {
+                        // The hit is gone (the remote opened at an end instead): no jumping
+                        // to it later, when scrolling happens to load it.
+                        if reader.records.is_empty()
+                            && let Some(id) = &reader.row.record_id
+                            && !page.records.iter().any(|r| &r.record_id == id)
+                        {
+                            reader.jump_to_anchor = false;
+                        }
+                        if reader.merge(page) {
+                            reader.layout_key = None;
+                        } else {
+                            reader.stalled = true;
+                        }
                     }
-                    Ok(_) => {}
                     Err(message) => reader.error = Some(message),
                 }
             }
@@ -653,26 +832,16 @@ impl App {
         {
             self.status = None;
         }
-        // Load further pages as the reader nears the end of what it has.
+        // Load further pages as the reader nears an end of what it has.
         if let Some(reader) = self.reader.as_mut()
-            && !reader.loading
-            && reader.error.is_none()
-            && let Some(offset) = reader.next_offset
+            && let Some(span) = reader.next_span()
         {
-            let anchor_missing = reader.jump_to_anchor
-                && reader
-                    .row
-                    .record_id
-                    .as_ref()
-                    .is_some_and(|id| !reader.records.iter().any(|r| &r.record_id == id));
-            let near_end = reader.scroll + reader.view_height * 2 >= reader.lines.len();
-            if reader.records.is_empty() || anchor_missing || near_end {
-                reader.loading = true;
-                self.effects.push(Effect::Page {
-                    key: reader.row.key.clone(),
-                    offset,
-                });
-            }
+            reader.loading = true;
+            self.effects.push(Effect::Page {
+                key: reader.row.key.clone(),
+                generation: reader.generation,
+                span,
+            });
         }
     }
 
@@ -1009,6 +1178,7 @@ impl App {
                 }
             }
             KeyCode::Tab => self.toggle_split(),
+            KeyCode::Char('O') => self.toggle_order(),
             KeyCode::Char('o') | KeyCode::Char('l') | KeyCode::Right => self.open_reader(),
             KeyCode::Char('J') => self.preview_scroll += 3,
             KeyCode::Char('K') => self.preview_scroll = self.preview_scroll.saturating_sub(3),
@@ -1070,6 +1240,7 @@ impl App {
             }
             KeyCode::Char('n') => self.move_selection(1),
             KeyCode::Char('p') => self.move_selection(-1),
+            KeyCode::Char('O') => self.toggle_order(),
             KeyCode::Enter => {
                 self.peek = false;
                 self.request_command(Purpose::Run);
@@ -1083,9 +1254,35 @@ impl App {
     }
 
     fn open_reader(&mut self) {
-        if let Some(row) = self.selected_row().cloned() {
-            self.reader = Some(Reader::new(row));
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        // The preview already learnt how long the session is; reading from its end then
+        // needs no extra request.
+        let total = match self.preview_key().and_then(|k| self.previews.get(&k)) {
+            Some(PreviewState::Ready(preview)) => preview.total,
+            _ => None,
+        };
+        self.reader = Some(Reader::new(row, self.newest_first, total));
+    }
+
+    pub fn order_label(&self) -> &'static str {
+        if self.newest_first {
+            "最新在前"
+        } else {
+            "最早在前"
         }
+    }
+
+    /// Newest or oldest records first, in previews and the reader.
+    fn toggle_order(&mut self) {
+        self.newest_first = !self.newest_first;
+        // A hit's preview depends on the order.
+        self.schedule_preview();
+        if let Some(reader) = self.reader.as_mut() {
+            reader.set_order(self.newest_first);
+        }
+        self.set_status(self.order_label());
     }
 
     fn reader_key(&mut self, key: KeyEvent) {
@@ -1130,8 +1327,33 @@ impl App {
                 reader.scroll_by(page - 1)
             }
             KeyCode::PageUp | KeyCode::Char('b') => reader.scroll_by(-(page - 1)),
-            KeyCode::Home | KeyCode::Char('g') => reader.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => reader.scroll = reader.max_scroll(),
+            KeyCode::Home | KeyCode::Char('g') => {
+                // The top of the screen is one end of the session; go there even when it is
+                // not loaded.
+                let missing = if reader.newest_first {
+                    reader.has_newer()
+                } else {
+                    reader.has_older()
+                };
+                if missing {
+                    reader.restart(reader.newest_first, false);
+                } else {
+                    reader.scroll = 0;
+                }
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                let missing = if reader.newest_first {
+                    reader.has_older()
+                } else {
+                    reader.has_newer()
+                };
+                if missing {
+                    reader.restart(!reader.newest_first, true);
+                } else {
+                    reader.scroll = reader.max_scroll();
+                }
+            }
+            KeyCode::Char('O') => self.toggle_order(),
             KeyCode::Char('/') => reader.find_input = Some(String::new()),
             KeyCode::Char('n') => {
                 if !reader.jump_match(true) {
@@ -1528,6 +1750,7 @@ mod tests {
             project: "p".into(),
             role: "user".into(),
             snippet: "部署\n完成".into(),
+            title: Some("上线 checklist".into()),
         };
         app.query = "部署".into();
         let generation = app.generation;
@@ -1548,10 +1771,59 @@ mod tests {
         assert_eq!(app.rows.len(), 2);
         assert_eq!(app.rows[0].record_id.as_deref(), Some("r1"));
         assert_eq!(app.rows[0].text, "部署 完成");
+        assert_eq!(app.rows[0].title, "上线 checklist");
     }
 
-    #[test]
-    fn reader_loads_pages_until_the_hit_and_finds_text() {
+    fn rec(i: u32) -> RecordView {
+        RecordView {
+            record_id: format!("r{i}"),
+            ts_ms: i as i64,
+            role: "user".into(),
+            tool_name: None,
+            text: format!("text {i}"),
+            total_chars: 6,
+            truncated: false,
+        }
+    }
+
+    fn page(offset: u32, count: u32, total: u32) -> crate::model::Page {
+        crate::model::Page {
+            session_id: "a".into(),
+            source_path: "/a".into(),
+            offset,
+            total: Some(total),
+            next_offset: (offset + count < total).then_some(offset + count),
+            records: (offset..offset + count).map(rec).collect(),
+        }
+    }
+
+    /// The one page the reader asks for now, if any.
+    fn reader_span(app: &mut App) -> Option<(u64, Span)> {
+        app.on_tick();
+        let effects = app.take_effects();
+        let spans: Vec<(u64, Span)> = effects
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Page {
+                    generation, span, ..
+                } => Some((generation, span)),
+                _ => None,
+            })
+            .collect();
+        assert!(spans.len() <= 1, "{spans:?}");
+        spans.into_iter().next()
+    }
+
+    fn reply(app: &mut App, generation: u64, page: crate::model::Page) {
+        let key = app.reader.as_ref().unwrap().row.key.clone();
+        app.on_msg(Msg::Page {
+            key,
+            generation,
+            result: Ok(page),
+        });
+    }
+
+    fn one_session_app() -> App {
         let mut app = app();
         let generation = app.generation;
         app.on_msg(Msg::Rows {
@@ -1564,43 +1836,96 @@ mod tests {
             ),
         });
         app.focus = Focus::List;
-        app.rows[0].record_id = Some("r9".into());
-        app.on_key(key(KeyCode::Char('o')));
-        app.on_tick();
-        assert!(matches!(
-            &app.take_effects()[..],
-            [Effect::Page { offset: 0, .. }]
-        ));
-        let rec = |id: &str| RecordView {
-            record_id: id.into(),
-            ts_ms: 1,
-            role: "user".into(),
-            tool_name: None,
-            text: format!("text {id}"),
-            total_chars: 6,
-            truncated: false,
-        };
-        let page = crate::model::Page {
-            session_id: "a".into(),
-            source_path: "/a".into(),
-            offset: 0,
-            total: Some(10),
-            next_offset: Some(5),
-            records: vec![rec("r1"), rec("r2")],
-        };
-        let k = app.reader.as_ref().unwrap().row.key.clone();
-        app.on_msg(Msg::Page {
-            key: k.clone(),
-            offset: 0,
-            result: Ok(page),
-        });
-        app.on_tick();
-        // The hit is not loaded yet, so the next page is requested right away.
-        assert!(matches!(
-            &app.take_effects()[..],
-            [Effect::Page { offset: 5, .. }]
-        ));
+        app
+    }
 
+    #[test]
+    fn the_reader_opens_at_the_hit_and_grows_both_ways() {
+        let mut app = one_session_app();
+        assert!(app.newest_first, "newest first by default");
+        app.rows[0].record_id = Some("r50".into());
+        app.on_key(key(KeyCode::Char('o')));
+        let (generation, span) = reader_span(&mut app).unwrap();
+        assert_eq!(
+            span,
+            Span::Around {
+                record_id: "r50".into(),
+                before: 80,
+                after: 20
+            },
+            "newest first, what came before the hit follows it on screen"
+        );
+        assert_eq!(reader_span(&mut app), None, "one request at a time");
+        reply(&mut app, generation, page(40, 21, 300));
+        let reader = app.reader.as_ref().unwrap();
+        assert_eq!((reader.start, reader.end()), (40, 61));
+        let shown: Vec<&str> = reader.shown().map(|r| r.record_id.as_str()).collect();
+        assert_eq!(shown[0], "r60", "newest at the top");
+
+        // Nothing laid out yet, so the bottom (older records) is near: read before the window.
+        let (generation, span) = reader_span(&mut app).unwrap();
+        assert_eq!(span, Span::Before(40));
+        reply(&mut app, generation, page(0, 40, 300));
+        let reader = app.reader.as_mut().unwrap();
+        assert_eq!((reader.start, reader.end()), (0, 61));
+        // Far from both ends: nothing more to read.
+        reader.lines = (0..400).map(|i| Line::from(format!("line {i}"))).collect();
+        reader.view_height = 10;
+        reader.scroll = 100;
+        assert_eq!(reader_span(&mut app), None);
+        // At the top, the newer records come next.
+        app.reader.as_mut().unwrap().scroll = 0;
+        let (generation, span) = reader_span(&mut app).unwrap();
+        assert_eq!(span, Span::From(61));
+        // A page that adds nothing stops the loading instead of asking again and again.
+        reply(&mut app, generation, page(0, 10, 300));
+        assert_eq!(reader_span(&mut app), None);
+    }
+
+    #[test]
+    fn order_and_ends_restart_the_reader_where_needed() {
+        let mut app = one_session_app();
+        app.on_key(key(KeyCode::Char('o')));
+        let (generation, span) = reader_span(&mut app).unwrap();
+        assert_eq!(
+            span,
+            Span::Before(u32::MAX),
+            "newest first opens at the end"
+        );
+        reply(&mut app, generation, page(200, 100, 300));
+        assert_eq!(app.reader.as_ref().unwrap().total, Some(300));
+
+        // Oldest first: the start is not loaded, so start over from it.
+        app.on_key(key(KeyCode::Char('O')));
+        assert!(!app.newest_first);
+        let reader = app.reader.as_ref().unwrap();
+        assert!(reader.records.is_empty());
+        assert!(!reader.newest_first);
+        let (fresh, span) = reader_span(&mut app).unwrap();
+        assert_eq!(span, Span::From(0));
+        assert_ne!(fresh, generation);
+        // A page asked for before the switch is dropped.
+        reply(&mut app, generation, page(100, 100, 300));
+        assert!(app.reader.as_ref().unwrap().records.is_empty());
+        reply(&mut app, fresh, page(0, 300, 300));
+        // Everything is loaded: switching back keeps it and only lays it out again.
+        app.on_key(key(KeyCode::Char('O')));
+        let reader = app.reader.as_ref().unwrap();
+        assert_eq!(reader.records.len(), 300);
+        assert_eq!(reader.shown().next().unwrap().record_id, "r299");
+
+        // `G` (the oldest end, newest first) is loaded too, so it only scrolls.
+        let reader = app.reader.as_mut().unwrap();
+        reader.lines = (0..400).map(|i| Line::from(format!("line {i}"))).collect();
+        reader.view_height = 10;
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.reader.as_ref().unwrap().scroll, 390);
+    }
+
+    #[test]
+    fn the_reader_finds_text_and_closes() {
+        let mut app = one_session_app();
+        app.on_key(key(KeyCode::Char('o')));
         let reader = app.reader.as_mut().unwrap();
         reader.lines = (0..50).map(|i| Line::from(format!("line {i}"))).collect();
         reader.view_height = 10;
@@ -1609,5 +1934,34 @@ mod tests {
         assert_eq!(reader.scroll, 40);
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.reader.is_none());
+    }
+
+    #[test]
+    fn order_toggles_from_the_list_and_the_peek() {
+        let mut app = one_session_app();
+        app.on_key(key(KeyCode::Char('O')));
+        assert!(!app.newest_first);
+        assert_eq!(app.query, "", "O is not typed into the search box");
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.peek);
+        app.preview_scroll = 7;
+        app.on_key(key(KeyCode::Char('O')));
+        assert!(app.newest_first);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "back to the top, where the newest are"
+        );
+
+        // A session's preview serves both orders; a hit's context depends on the order.
+        let session_key = app.preview_key().unwrap();
+        app.on_key(key(KeyCode::Char('O')));
+        assert_eq!(app.preview_key().unwrap(), session_key);
+        app.rows[0].record_id = Some("r1".into());
+        let hit_key = app.preview_key().unwrap();
+        app.on_key(key(KeyCode::Char('O')));
+        assert_ne!(app.preview_key().unwrap(), hit_key);
+        app.preview_due = Some(Instant::now() - Duration::from_millis(1));
+        app.on_tick();
+        assert!(matches!(&app.take_effects()[..], [Effect::Preview(k)] if k.newest_first));
     }
 }

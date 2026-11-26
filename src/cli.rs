@@ -167,7 +167,7 @@ pub struct SearchArgs {
     pub sel: MachineSel,
     #[command(flatten)]
     pub filters: FilterArgs,
-    /// Only records with this role (user, assistant, tool_use, tool_result)
+    /// Only records with this role (user, assistant, tool_use, tool_result, summary)
     #[arg(long)]
     pub role: Option<String>,
     /// Only this session; its best matches are listed in time order
@@ -616,6 +616,7 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<i32> {
             limit: 1,
             max_chars: model::MAX_CHARS_MIN,
             tool_chars: None,
+            record_chars: None,
         };
         let outcomes = ctx
             .runner
@@ -673,6 +674,7 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<i32> {
                 limit,
                 max_chars: args.max_chars,
                 tool_chars: (args.tool_chars > 0).then_some(args.tool_chars),
+                record_chars: None,
             };
             request.validate().map_err(|e| anyhow!(e))?;
             Op::Read(request)

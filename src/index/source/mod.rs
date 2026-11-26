@@ -28,6 +28,8 @@ pub enum Role {
     Assistant = 1,
     ToolUse = 2,
     ToolResult = 3,
+    /// What the agent wrote about the session itself, such as Claude Code's recaps.
+    Summary = 4,
 }
 
 impl Role {
@@ -37,6 +39,7 @@ impl Role {
             Role::Assistant => "assistant",
             Role::ToolUse => "tool_use",
             Role::ToolResult => "tool_result",
+            Role::Summary => "summary",
         }
     }
 
@@ -45,6 +48,7 @@ impl Role {
             0 => Role::User,
             1 => Role::Assistant,
             2 => Role::ToolUse,
+            4 => Role::Summary,
             _ => Role::ToolResult,
         }
     }
@@ -55,6 +59,7 @@ impl Role {
             "assistant" => Role::Assistant,
             "tool_use" | "tool_call" => Role::ToolUse,
             "tool_result" | "tool_output" => Role::ToolResult,
+            "summary" => Role::Summary,
             _ => return None,
         })
     }

@@ -85,6 +85,36 @@ fn walk(dir: &Path, depth: usize) -> Vec<PathBuf> {
     files
 }
 
+/// `session_index.jsonl` in a Codex home: a line `{"id", "thread_name", "updated_at"}` each
+/// time a thread gets a name (Codex names it after the first turn; `/rename` sets one). The
+/// last line for a thread wins. Rollouts themselves do not hold the name.
+pub fn names_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("session_index.jsonl")
+}
+
+/// Thread names in `bytes` (complete lines only), and how many bytes those lines take.
+pub fn parse_names(bytes: &[u8]) -> (Vec<(String, String)>, usize) {
+    let mut names = Vec::new();
+    let mut used = 0;
+    while let Some(end) = bytes[used..].iter().position(|&b| b == b'\n') {
+        let line = &bytes[used..used + end];
+        used += end + 1;
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+        let name = crate::text::collapse_ws(
+            v.get("thread_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if !id.is_empty() && !name.is_empty() {
+            names.push((id.to_string(), crate::text::truncate_chars(&name, 80).0));
+        }
+    }
+    (names, used)
+}
+
 /// `cd '<cwd>' && codex resume <id>`; spawned helper threads reopen their parent.
 pub fn resume_command(
     session_id: &str,

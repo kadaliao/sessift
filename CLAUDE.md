@@ -2,7 +2,7 @@
 
 搜索、浏览、恢复 AI 编程助手会话（Claude Code、Codex、Pi、OpenCode、Grok 等）的命令行工具，覆盖本机和其他机器。机器之间不同步数据：查询时到各台机器现场查，只传结果。起因是 memex 在多机场景下太慢，见 `docs/plan.md` 的"背景"一节。
 
-## 当前状态（2026-10-31）
+## 当前状态（2026-11-26）
 
 - 已完成：远程查询层、交互界面（Alt-M），阶段 2 自研索引（`src/index/`）。本机和 mm 都已切到 native，和 memex 的延迟、结果集对比做完，memex 适配器已删除。结果见 `docs/plan.md` 的阶段 2。
 - 2026-10-31 本机和 mm 都已卸载 memex（连同 herdr 插件），会话搜索只用 sessift。
@@ -14,6 +14,7 @@
 - 2026-10-31 v0.3.1：修复 zsh 快捷键打开界面后收不到按键（crossterm `use-dev-tty`）；README 改用带按键的 GIF（`scripts/screenshots/run.sh` 生成）。mm 上 brew 装的 sessift 和远端服务都已更新，mm 也装了 skill、herdr 插件，配置里能查本机（本机 `~/.sessift/bin/sessift` 链接到 `~/.local/bin/sessift`）。
 - 2026-10-31 v0.3.2：herdr 新开 tab 恢复时等提示符出来再敲命令（原来命令显示两遍）；浮层左边框压在中文上不再消失（sessift 的 `clear_overlay`，herdr 插件 0.1.1 浮层改成 100% 宽）。
 - 2026-11-08 v0.3.3：远端是 macOS 时，恢复 Claude 会话前先检查钥匙串，SSH 会话里读不到就提示输入密码解锁（原来 Claude 直接要求 /login）；README 写了用 `claude setup-token` 免输密码的办法。只改了客户端。
+- 2026-11-26（未提交、未发版，本机和 mm 已装上）：预览和全文默认最新的在前，`O` 切换；全文改成可以向两头扩展的窗口；列表和搜索结果突出 agent 生成的标题（Claude `ai-title` 提前，新读 Codex 的 `session_index.jsonl`），Claude 的回顾成为 `summary` 记录。协议加了 `read.record_chars`、`SearchHit.title`。见 `docs/plan.md` 的"阶段 6"。
 - **待用户决定**：向量检索做不做（评测里换了说法的 7 条查询全部找不到，其余已全部进前 10）；要不要在索引时屏蔽明文密钥。
 - 代码在 GitHub：https://github.com/kadaliao/sessift （公开仓库，文档和示例里不要出现私人环境信息和真实会话内容）。
 

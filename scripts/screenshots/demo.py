@@ -22,13 +22,14 @@ def uid(seed):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "sessift-demo/" + seed))
 
 
-# (machine, source, project, minutes ago, turns)
-# turns: ("u", text) | ("a", text) | ("t", tool, input, output)
+# (machine, source, project, minutes ago, turns, title)
+# turns: ("u", text) | ("a", text) | ("t", tool, input, output) | ("r", recap, Claude only)
+# title: the name the agent gave the session (Claude's ai-title, Codex's thread name)
 S = []
 
 
-def session(machine, source, project, ago, *turns):
-    S.append((machine, source, project, ago, turns))
+def session(machine, source, project, ago, *turns, title=None):
+    S.append((machine, source, project, ago, turns, title))
 
 
 session("local", "claude", "shop-api", 4,
@@ -39,10 +40,13 @@ session("local", "claude", "shop-api", 4,
     ("u", "改吧，然后灰度发布"),
     ("t", "Edit", {"file_path": "deploy/nginx.conf", "old_string": "proxy_read_timeout 5s;", "new_string": "proxy_read_timeout 15s;"}, "The file deploy/nginx.conf has been updated."),
     ("a", "已修改。发布计划：\n\n- 先灰度 10% 流量，观察 30 分钟错误率\n- 502 比例低于 0.1% 再全量\n- 有问题用 `make rollback` 一键回滚到上一个版本"),
+    ("r", "目标是消除结算接口高峰期的 502：上游超时已从 5 秒调到 15 秒，正在灰度 10% 流量。下一步：观察 30 分钟错误率，没问题再全量。"),
+    title="结算接口 502 排查与灰度",
 )
 session("local", "claude", "notes-app", 31,
     ("u", "两台设备同时编辑同一篇笔记时，同步冲突怎么合并？"),
     ("a", "推荐按段落做三方合并：以上次同步的版本为基准，两边都改了同一段时保留两份，并在界面上提示用户选择。\n\n- 只有一边改动：直接采用\n- 两边改了不同段落：自动合并\n- 改了同一段：生成冲突副本"),
+    title="笔记同步冲突合并",
 )
 session("local", "codex", "infra", 125,
     ("u", "staging 的数据库迁移 0042 失败了，看看 runbook，现在还能不能回滚？"),
@@ -52,6 +56,7 @@ session("local", "codex", "infra", 125,
     ("u", "先暂停写入，把状态给我看看"),
     ("t", "exec_command", {"cmd": "infractl pause --env staging && infractl status --env staging"}, "writers paused (3 workers)\nstatus: paused, replication lag 0s"),
     ("a", "写入已暂停（3 个 worker），复制延迟 0 秒。你确认后我就开始恢复快照。"),
+    title="staging 迁移 0042 回滚",
 )
 session("local", "pi", "notes-app", 190,
     ("u", "Add a dark mode toggle and persist the choice in localStorage"),
@@ -62,6 +67,7 @@ session("local", "pi", "notes-app", 190,
 session("local", "claude", "infra", 660,
     ("u", "terraform plan 显示要重建 RDS 实例，帮我看看为什么"),
     ("a", "是 `engine_version` 从 15.4 变成了 15.6 引起的。小版本升级不需要重建，加上 `allow_major_version_upgrade = false` 并设置 `apply_immediately = false`，plan 就会变成原地更新。"),
+    title="RDS 重建原因排查",
 )
 session("local", "claude", "blog", 1500,
     ("u", "给博客加上 RSS 订阅和站点地图"),
@@ -105,6 +111,7 @@ session("devbox", "claude", "ml-train", 24,
     ("a", "多半是学习率预热结束后梯度爆炸。先打开梯度裁剪（`max_norm=1.0`），再检查数据里有没有空标签。"),
     ("t", "Bash", {"command": "python check_labels.py data/train.jsonl", "description": "检查空标签"}, "empty labels: 0\nmax grad norm (epoch 3): 4821.7"),
     ("a", "数据没问题，梯度范数在第 3 个 epoch 冲到 4800。加上梯度裁剪后重跑，loss 已经稳定下降。"),
+    title="训练 loss 变 NaN 排查",
 )
 session("devbox", "codex", "crawler", 300,
     ("u", "爬虫被目标站点限流了，加上指数退避和代理池"),
@@ -138,7 +145,7 @@ session("devbox", "codex", "docs-site", 18900,
 )
 
 
-def claude(home, sid, cwd, lines):
+def claude(home, sid, cwd, lines, title):
     proj = cwd.replace("/", "-")
     path = os.path.join(home, ".claude/projects", proj, sid + ".jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -160,12 +167,16 @@ def claude(home, sid, cwd, lines):
             output, tid = data
             base.update(type="user", message={"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": tid, "content": output}]})
+        elif kind == "r":
+            base.update(type="system", subtype="away_summary", content=data + " (disable recaps in /config)")
         out.append(json.dumps(base, ensure_ascii=False))
         parent = u
+    if title:
+        out.append(json.dumps({"type": "ai-title", "aiTitle": title, "sessionId": sid}, ensure_ascii=False))
     open(path, "w").write("\n".join(out) + "\n")
 
 
-def codex(home, sid, cwd, lines):
+def codex(home, sid, cwd, lines, title):
     t0 = lines[0][0]
     day = datetime.fromtimestamp(t0, timezone.utc)
     path = os.path.join(home, ".codex/sessions", day.strftime("%Y/%m/%d"),
@@ -187,9 +198,13 @@ def codex(home, sid, cwd, lines):
             p = {"type": "function_call_output", "call_id": cid, "output": output}
         out.append({"timestamp": iso(t), "type": "response_item", "payload": p})
     open(path, "w").write("\n".join(json.dumps(x, ensure_ascii=False) for x in out) + "\n")
+    if title:
+        with open(os.path.join(home, ".codex/session_index.jsonl"), "a") as names:
+            names.write(json.dumps({"id": sid, "thread_name": title, "updated_at": iso(lines[-1][0])},
+                                   ensure_ascii=False) + "\n")
 
 
-def pi(home, sid, cwd, lines):
+def pi(home, sid, cwd, lines, title):
     t0 = lines[0][0]
     stamp = datetime.fromtimestamp(t0, timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-000Z")
     d = os.path.join(home, ".pi/agent/sessions", "-" + cwd.replace("/", "-") + "--")
@@ -217,7 +232,7 @@ def pi(home, sid, cwd, lines):
 
 
 shutil.rmtree(ROOT, ignore_errors=True)
-for n, (machine, source, project, ago, turns) in enumerate(S):
+for n, (machine, source, project, ago, turns, title) in enumerate(S):
     home = os.path.join(ROOT, machine, "home")
     base = "/Users/alice/work" if machine == "local" else "/home/alice/src"
     cwd = f"{base}/{project}"
@@ -235,7 +250,7 @@ for n, (machine, source, project, ago, turns) in enumerate(S):
             flat.append(turn)
     end = NOW - ago * 60
     lines = [(end - (len(flat) - 1 - i) * 40, kind, data) for i, (kind, data) in enumerate(flat)]
-    {"claude": claude, "codex": codex, "pi": pi}[source](home, sid, cwd, lines)
+    {"claude": claude, "codex": codex, "pi": pi}[source](home, sid, cwd, lines, title)
 
 for machine in ("local", "devbox"):
     os.makedirs(os.path.join(ROOT, machine, "sessift"), exist_ok=True)

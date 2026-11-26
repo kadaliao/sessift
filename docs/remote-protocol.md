@@ -118,8 +118,12 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 {"kind":"search","hits":[{
   "score":28.03,"ts_ms":1785397215000,"source":"claude","session_id":"7c1e…",
   "source_path":"/Users/…/7c1e….jsonl","record_id":"rid1_…","project":"shop-api",
-  "role":"assistant","snippet":"PR 已合并，开始部署 shop-api。"}]}
+  "role":"assistant","snippet":"PR 已合并，开始部署 shop-api。","title":"shop-api 上线"}]}
 ```
+
+`title` 是命中所在会话的标题，没有标题时省略；0.3.3 及更早的服务端不返回，交互界面这时只显示片段。
+
+记录的 `role` 是 `user`、`assistant`、`tool_use`、`tool_result`，或 `summary`：agent 自己对会话的回顾（目前是 Claude Code 的"离开期间回顾"）。旧版客户端不认识 `summary`，交互界面里不显示这类记录。
 
 ### `sessions`
 
@@ -137,7 +141,9 @@ sessift 的客户端（CLI 或 broker）和远端服务 `sessift serve --stdio` 
 
 ### `read`
 
-参数：`session_id`（必填）、`source_path`、`offset`（默认 0）、`limit`（1～500，默认 50）、`max_chars`（整页正文字符预算，256～200000，默认 16000）、`tool_chars`（可选：分配预算之前，每条工具调用和工具输出先截到这么多字符，免得长输出挤掉对话；不填就不截。命令行默认 1500，交互界面不填。旧版服务端会忽略）。
+参数：`session_id`（必填）、`source_path`、`offset`（默认 0）、`limit`（1～500，默认 50）、`max_chars`（整页正文字符预算，256～200000，默认 16000）、`tool_chars`（可选：分配预算之前，每条工具调用和工具输出先截到这么多字符，免得长输出挤掉对话；不填就不截。命令行默认 1500，交互界面不填。旧版服务端会忽略）、`record_chars`（可选：分配预算之前，每条记录都先截到这么多字符。`limit × record_chars` 不超过 `max_chars` 时，这一页一定读到最后一条，交互界面的预览靠它拿到会话最新的几条。0.3.3 及更早的服务端会忽略，预算用完时页就提前结束）。
+
+offset 超过末尾的 `read` 不返回记录，但 `total` 照常给出，可以用来先问会话有多长（`read --tail`、交互界面按最新在前打开全文时都这么做）。
 
 ```json
 {"kind":"page","session_id":"a1b2…","source_path":"/Users/…","offset":0,"total":192,"next_offset":3,

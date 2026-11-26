@@ -47,13 +47,14 @@ struct Titles {
 }
 
 impl Titles {
-    /// The user's own naming first, then their first words, then generated names.
+    /// The user's own naming first, then Claude Code's title (it sums up the session and
+    /// follows it as it moves on), then the first words.
     fn best(&self) -> Option<&str> {
         [
             &self.custom,
             &self.description,
-            &self.first_prompt,
             &self.ai,
+            &self.first_prompt,
             &self.agent_name,
             &self.summary,
             &self.command,
@@ -134,7 +135,7 @@ pub fn resume_command(session_id: &str, cwd: Option<&str>, parent: Option<&str>)
 
 impl JsonlFormat for Claude {
     const SOURCE: &'static str = "claude";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type State = State;
 
     fn begin(&self, path: &Path, state: &mut State, meta: &mut Meta) {
@@ -214,6 +215,7 @@ impl JsonlFormat for Claude {
             "assistant" => assistant(v, state, meta, out),
             "user" => user(v, state, out),
             "attachment" => queued_prompt(v, state, out),
+            "system" => recap(v, out),
             _ => return,
         }
         update_title(state, meta);
@@ -411,6 +413,23 @@ fn queued_prompt(v: &Value, state: &mut State, out: &mut Vec<Item>) {
             state.titles.first_prompt = title_candidate(&raw, &mut state.titles.command);
         }
         out.push(Item::new(Role::User, text).at(time_ms(v.get("timestamp"))));
+    }
+}
+
+/// Claude Code's recap for someone coming back to the session ("while you were away"):
+/// where things stand and what is next.
+fn recap(v: &Value, out: &mut Vec<Item>) {
+    if v.get("subtype").and_then(Value::as_str) != Some("away_summary") {
+        return;
+    }
+    let text = v.get("content").and_then(Value::as_str).unwrap_or_default();
+    let text = text.trim();
+    let text = text
+        .strip_suffix("(disable recaps in /config)")
+        .unwrap_or(text)
+        .trim_end();
+    if !text.is_empty() {
+        out.push(Item::new(Role::Summary, text).at(time_ms(v.get("timestamp"))));
     }
 }
 
@@ -762,7 +781,16 @@ mod tests {
         let meta = &parsed.state.meta;
         assert_eq!(meta.kind.as_deref(), Some("main"));
         assert_eq!(meta.cwd.as_deref(), Some("/Users/alice/work/shop-api"));
-        assert_eq!(parsed.records.len(), 19, "{:#?}", parsed.records);
+        assert_eq!(parsed.records.len(), 20, "{:#?}", parsed.records);
+        // Claude Code's own title wins over the first question; its recap is a record.
+        assert_eq!(meta.title.as_deref(), Some("订单接口 502 排查"));
+        let recap = parsed.records.last().unwrap();
+        assert_eq!(recap.role, Role::Summary);
+        assert!(
+            recap.text.starts_with("While you were away"),
+            "{}",
+            recap.text
+        );
         let rollback: Vec<_> = parsed
             .records
             .iter()

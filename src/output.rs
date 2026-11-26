@@ -119,6 +119,7 @@ pub fn hit_json(hit: &Located<SearchHit>) -> Value {
         "ts": rfc3339(h.ts_ms),
         "source": h.source,
         "project": h.project,
+        "title": h.title,
         "role": h.role,
         "snippet": h.snippet,
         "source_path": h.source_path,
@@ -252,6 +253,7 @@ fn clean_hit(h: &SearchHit) -> SearchHit {
         project: text::sanitize_line(&h.project),
         role: text::sanitize_line(&h.role),
         snippet: text::sanitize_line(&h.snippet),
+        title: h.title.as_deref().map(text::sanitize_line),
         ..h.clone()
     }
 }
@@ -372,6 +374,16 @@ pub fn render_hits(hits: &[Located<SearchHit>], query: &str) -> String {
         );
         out.push_str(&header);
         out.push('\n');
+        if let Some(title) = h.title.as_deref()
+            && !text::title_in_snippet(title, &h.snippet)
+        {
+            out.push_str("       ");
+            out.push_str(&style.bold(&fit_width(
+                &text::collapse_ws(title),
+                width.saturating_sub(7),
+            )));
+            out.push('\n');
+        }
         for line in wrap(&h.snippet, width.saturating_sub(7))
             .into_iter()
             .take(4)

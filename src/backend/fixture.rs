@@ -105,6 +105,7 @@ impl FixtureBackend {
                     project: session.project.clone(),
                     role: record.role.clone(),
                     snippet: text::snippet_around(&record.text, &terms, req.snippet_chars as usize),
+                    title: session.title.clone(),
                 });
             }
         }
